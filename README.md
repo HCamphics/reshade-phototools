@@ -30,8 +30,7 @@ The dust map in `Textures/LensDirt` is a transmission map also made by yours tru
 ## Install
 
 Merge `reshade-shaders/` into the game's ReShade folder. The shaders sit in
-`Shaders/HCamphicsPhotoTools/`; ReShade searches the whole `Shaders` tree, so that folder layout is
-only for tidiness and can be changed freely.
+`Shaders/HCamphicsPhotoTools/`.
 
 ## Licence
 
