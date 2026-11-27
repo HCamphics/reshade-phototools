@@ -6,28 +6,30 @@ A ReShade shader collection for in-game photography.
 ## Contents
 
 **FFT Bloom** - a from-scratch implementation of Unreal Engine's bloom convolution, plus
-extensions: a procedural aperture kernel, spectral dispersion and a ray-emphasis control.
+extensions: a procedural aperture kernel, spectral dispersion, beam emphasis, and lens dust that
+scatters the light.
 
 Two effects share one implementation (`UE_FFTBloom_Common.fxh`) and differ only in where the
 kernel comes from:
 
-- `UE_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls. 
+- `UE_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls.
 - `UE_FFTBloom.fx` — the kernel is read from a DDS kernel in `reshade-shaders/Textures/Kernels`.
 
+Enable one or the other. The DDS effect needs the
+`Kernels` folder; the aperture effect does not.
 
-### Kernels
+### Kernels and textures
 
-The kernels in `Textures/Kernels` are included, more planned. Adding or removing one means declaring it in the shader.
+The kernels in `Textures/Kernels` are included and made by yours truly, more planned. Adding or removing one means declaring it in the shader.
 
+The dust map in `Textures/LensDirt` is a transmission map also made by yours truly, white is a clean lens, black is dirt.
 
 ## Requirements
 - ReShade 6.8.0 minimum. Any graphics API with **compute shader** support: D3D11 / D3D12 / Vulkan / OpenGL 4.3+
 
-
 ## Install
 
-Merge `reshade-shaders/` into the game's ReShade folder
-
+Merge `reshade-shaders/` into the game's ReShade folder.
 
 ## Licence
 
@@ -41,3 +43,6 @@ and all modifications to generated code.
 - [RealBloom](https://github.com/bean-mhm/realbloom) by bean-mhm (behavioral reference)
 - [Unity high-performance convolution bloom](https://github.com/StellarWarp/High-Performance-Convolution-Bloom-On-Unity) (behavioral reference)
 - [iMMERSE FFT bloom](https://guides.martysmods.com/shaders/immerseultimate/convolutionbloom/) by Pascal Gilcher (settings reference)
+- [An optical model for image artifacts produced by dust
+  particles on lenses](https://www-robotics.jpl.nasa.gov/media/documents/3_willson_11b.pdf) by Willson, Maimone, Johnson, and Scherr
+
