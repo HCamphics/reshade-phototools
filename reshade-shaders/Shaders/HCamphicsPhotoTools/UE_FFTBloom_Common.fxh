@@ -161,7 +161,7 @@ uniform float Threshold <
     ui_type = "drag"; ui_min = -1.0; ui_max = 5.0; ui_step = 0.01;
     ui_category = "Bloom";
     ui_label = "Threshold";
-    ui_tooltip = "Luminance above which pixels bloom. -1 removes the threshold so everything contributes, which is Unreal's physically based convolution bloom.";
+    ui_tooltip = "Luminance above which pixels bloom. -1 blooms everything, which is Unreal's default.";
 > = -1.0;
 
 uniform float SoftKnee <
@@ -175,7 +175,7 @@ uniform float HighlightShoulder <
     ui_type = "drag"; ui_min = 0.0; ui_max = 0.9; ui_step = 0.01;
     ui_category = "Bloom";
     ui_label = "Highlight Shoulder";
-    ui_tooltip = "Rolls the bloom input off with c/(1 + s*c) before the threshold, so a clipped white and a much brighter source do not bloom identically. 0 = off; 0.2-0.5 suits LDR games.";
+    ui_tooltip = "Softens how much a clipped white blooms compared to a brighter source. 0 = off; 0.2-0.5 suits LDR games.";
 > = 0.0;
 
 uniform int BlendMode <
@@ -183,14 +183,14 @@ uniform int BlendMode <
     ui_items = "Lerp (Unreal Style)\0Additive\0Screen\0";
     ui_category = "Bloom";
     ui_label = "Blend Mode";
-    ui_tooltip = "Additive is the physically correct one: scattered light adds, so Intensity is a gain and may exceed 1. Lerp is Unreal's artistic mix (1 = glow only). Screen brightens without clipping; additive reaches white first on LDR.";
+    ui_tooltip = "Additive adds the glow, which is physical but clips to white early. Lerp mixes toward it. Screen brightens without clipping.";
 > = 1;
 
 uniform float KernelScale <
     ui_type = "drag"; ui_min = 0.05; ui_max = 3.0; ui_step = 0.01;
     ui_category = "Kernel";
     ui_label = "Scale";
-    ui_tooltip = "Magnifies the PSF inside the transform grid: above 1 is a larger, softer glow but crops the outer rays, below 1 is tighter with the whole PSF visible.";
+    ui_tooltip = "Zooms the PSF in the grid: above 1 gives a larger, softer glow but crops the outer rays; below 1 keeps them all.";
 > = 1.0;
 
 uniform float KernelRotation <
@@ -213,7 +213,7 @@ uniform int KernelFile <
     ui_items = "DecagonApertureDirty\0DirtyStreak\0HeptagonApertureDirty\0HumanEye\0MovieLens\0PhoneCamera1\0PhoneCamera2\0Streak\0";
     ui_category = "Kernel";
     ui_label = "Kernel File";
-    ui_tooltip = "DDS file to convolve with, from reshade-shaders/Textures/Kernels. The list is declared at the top of this shader; the aperture effect bakes its own PSF instead.";
+    ui_tooltip = "DDS kernel to convolve with, from Textures/Kernels. The list is declared at the top of the shader.";
 > = 0;
 #endif
 
@@ -222,7 +222,7 @@ uniform int ApertureSides <
     ui_type = "drag"; ui_min = 3; ui_max = 32; ui_step = 1;
     ui_category = "Aperture";
     ui_label = "Sides";
-    ui_tooltip = "Blade count. 32 blades with Blade Curvature 1 is a smooth circle; fewer sides with 0 curvature give the sharp polygon corners that produce diffraction spikes.";
+    ui_tooltip = "Blade count. Fewer sides with 0 curvature give sharp corners and stronger spikes; 32 with curvature 1 is a circle.";
 > = 6;
 
 uniform float ApertureBladeCurvature <
@@ -236,15 +236,22 @@ uniform float ApertureSoftness <
     ui_type = "drag"; ui_min = 0.002; ui_max = 0.9; ui_step = 0.002;
     ui_category = "Aperture";
     ui_label = "Edge Softness";
-    ui_tooltip = "Width of the fade at the aperture edge. Below about 0.03 the rays stop getting brighter (measured: they saturate near 1.8% of the peak) and only the haze grows, so 0.03 is the useful floor.";
+    ui_tooltip = "Softness of the aperture edge. Below about 0.03 the rays stop getting brighter and only the haze grows.";
 > = 0.03;
 
-uniform float ApertureFalloff <
+uniform float ApertureRim <
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Aperture";
-    ui_label = "Falloff";
-    ui_tooltip = "0 = flat bokeh disc, 1 = soft Gaussian glow.";
-> = 0.15;
+    ui_label = "Soap Bubble Rim";
+    ui_tooltip = "Soap-bubble bokeh: weights the pupil toward its edge, giving a bright rim around a softer interior. 0 = flat disc.";
+> = 0.0;
+
+uniform float ApertureCentre <
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_category = "Aperture";
+    ui_label = "Pupil Centre";
+    ui_tooltip = "Hot-centre bokeh: weights the pupil toward its middle, fading outward. 0 = flat disc.";
+> = 0.0;
 
 uniform float ApertureRing <
     ui_type = "drag"; ui_min = 0.0; ui_max = 0.95; ui_step = 0.01;
@@ -253,25 +260,39 @@ uniform float ApertureRing <
     ui_tooltip = "Removes the aperture centre, giving the donut bokeh of a catadioptric lens.";
 > = 0.0;
 
+uniform float ApertureCatEye <
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_category = "Aperture";
+    ui_label = "Cat Eye";
+    ui_tooltip = "Cat's-eye pupils, as a fast lens gives at the frame corners. 1 is about 60% round; stopping down removes it. 0 = round.";
+> = 0.0;
+
+uniform float ApertureCatEyeAngle <
+    ui_type = "drag"; ui_min = -180.0; ui_max = 180.0; ui_step = 1.0;
+    ui_category = "Aperture";
+    ui_label = "Cat Eye Angle";
+    ui_tooltip = "Direction the cat's-eye bites. One kernel serves the whole frame, so it cannot follow the field angle.";
+> = 0.0;
+
 uniform float ApertureDispersion <
     ui_type = "drag"; ui_min = 0.0; ui_max = 0.5; ui_step = 0.005;
     ui_category = "Aperture";
     ui_label = "Dispersion";
-    ui_tooltip = "Channel-dependent aperture radius: red and blue see a different pupil size, so each ray fans into a spectrum. 0 = achromatic, 0.1-0.2 is a visible rainbow, higher smears the rays apart.";
+    ui_tooltip = "Splits the pupil radius per colour so rays fan into a spectrum. 0 = no colour; 0.1-0.2 is a visible rainbow.";
 > = 0.12;
 
 uniform float ApertureSize <
     ui_type = "drag"; ui_min = 0.005; ui_max = 0.6; ui_step = 0.001;
     ui_category = "Aperture";
     ui_label = "Size";
-    ui_tooltip = "Aperture radius on the transform grid. Smaller means wider diffraction and a bigger glow, like stopping down, but below about 0.2 the pupil is under-resolved and the pattern aliases into a lattice. 0.35-0.5 gives a clean star.";
+    ui_tooltip = "Pupil size on the grid. Smaller means a wider glow, like stopping down; below 0.2 it aliases. 0.35-0.5 is clean.";
 > = 0.35;
 
 uniform float ApertureBeamGain <
     ui_type = "drag"; ui_min = 1.0; ui_max = 8.0; ui_step = 0.05;
     ui_category = "Aperture";
     ui_label = "Beam Emphasis";
-    ui_tooltip = "A clean 7-blade pupil puts its rays near 2e-5 of the core peak, invisible on an LDR game. 2 lifts them to about 0.5% while the far field stays black; 3+ lifts the whole tail into a grey haze.";
+    ui_tooltip = "Lifts the diffraction rays out of the black. 2 puts them near 0.5% of the core; 3+ turns the tail into grey haze.";
 > = 2.0;
 #endif
 
@@ -289,7 +310,7 @@ uniform float KernelDehaze <
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Color";
     ui_label = "Kernel Dehaze";
-    ui_tooltip = "Dehazes the kernel with Photoshop's Levels midtone curve (1.0 down to 0.5): the haze between the rays drops away and colour is kept, since it works per channel. Artistic, not physical. 0 = off.";
+    ui_tooltip = "Deepens the kernel with a Photoshop Levels midtone pull, per channel, so colour survives. Artistic. 0 = off.";
 > = 0.0;
 
 #if KERNEL_MODE == 1
@@ -298,27 +319,27 @@ uniform float LensDirtStrength <
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Lens Dirt";
     ui_label = "Lens Dirt";
-    ui_tooltip = "How strongly the dust map modulates the pupil before it is diffracted. With Dust Scatter above 0, the light it blocks comes back as veiling glare instead of just a dimmer pupil. 0 = clean lens.";
+    ui_tooltip = "How strongly the dust map dims the pupil. With Dust Scatter up, the blocked light returns as glare. 0 = clean lens.";
 > = 0.0;
 
 uniform float LensDirtGain <
     ui_type = "drag"; ui_min = 1.0; ui_max = 8.0; ui_step = 0.1;
     ui_category = "Lens Dirt";
     ui_label = "Dust Gain";
-    ui_tooltip = "Brightens the dust map before it attenuates the pupil. The map is transmission, so bright means clean: it averages 0.84, and 4 leaves everything but the specks untouched.";
+    ui_tooltip = "Brightens the dust map before it dims the pupil. 4 keeps the clean field clear and darkens only the specks.";
 > = 4.0;
 
 uniform float LensDirtScatter <
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Lens Dirt";
     ui_label = "Dust Scatter";
-    ui_tooltip = "Energy conservation: the light the dust blocks is re-emitted over a wide angle, so it becomes a faint lift across the frame plus a wide halo instead of a dimmer pupil. Baked into the PSF, so it costs nothing per frame. 0 = off.";
+    ui_tooltip = "Turns the light the dust blocks into a faint veil plus a wide halo instead of only dimming. Baked once. 0 = off.";
 > = 0.0;
 
 uniform float LensDirtTiling <
     ui_type = "drag"; ui_min = 0.25; ui_max = 4.0; ui_step = 0.05;
     ui_category = "Lens Dirt";
-    ui_tooltip = "Repeats the dust map across the aperture.";
+    ui_tooltip = "Repeats the dust map. Above 1 each tile is shuffled so the repeat is hidden; 1 is one continuous pattern.";
     ui_label = "Dust Tiling";
 > = 1.0;
 #endif
@@ -491,14 +512,31 @@ float2 ComplexMul(float2 a, float2 b)
                   a.x * b.y + a.y * b.x);
 }
 
+// Bit reversal by hand rather than through the reversebits intrinsic: ReShade 6.8.0.2's parser
+// rejects it ("Function "reversebits" is not defined") even though its code generator emits it, and
+// the FFT only ever needs the low LOG2_FFT bits reversed. Unrolled, so it costs nothing at runtime.
 uint BitRev(uint i)
 {
-    return reversebits(i) >> (32u - LOG2_FFT);
+    uint r = 0u;
+    [unroll]
+    for (uint b = 0u; b < LOG2_FFT; ++b)
+    {
+        r = (r << 1u) | (i & 1u);
+        i >>= 1u;
+    }
+    return r;
 }
 
 uint BitRevBake(uint i)
 {
-    return reversebits(i) >> (32u - LOG2_BAKE);
+    uint r = 0u;
+    [unroll]
+    for (uint b = 0u; b < LOG2_BAKE; ++b)
+    {
+        r = (r << 1u) | (i & 1u);
+        i >>= 1u;
+    }
+    return r;
 }
 
 float Luminance(float3 c)
@@ -623,9 +661,43 @@ float ApertureMask(float2 d)
     if (ring > 0.001)
         mask *= smoothstep(ring * 0.85, ring + 1e-4, rn);
 
-    float falloff = saturate(ApertureFalloff);
-    if (falloff > 0.0)
-        mask *= lerp(1.0, exp(-2.5 * rn * rn), falloff);
+    // Apodization: the pupil's transmission profile. Real bokeh kernels show a narrow bright band at
+    // the pupil edge (under-corrected spherical aberration reads as a soap-bubble rim) and, on the
+    // other end, a broad centre glow. A narrow rim band plus a wide centre glow fitted six measured
+    // lens kernels to a mean profile error of 5.8%: band width 0.10 of the radius at 1.8x, centre
+    // width 0.55 at up to full removal of the rim. Applied to the mask, so it composes with blades,
+    // ring, cat's eye and dispersion for free. Both at zero leaves the disc flat and the shader inert.
+    float rim = saturate(ApertureRim);
+    float cen = saturate(ApertureCentre);
+    if (rim > 0.0 || cen > 0.0)
+    {
+        float band = exp(-(1.0 - rn) * (1.0 - rn) * 100.0);   // exp(-((1-rn)/0.10)^2)
+        float hot  = exp(-rn * rn * 3.3058);                  // exp(-(rn/0.55)^2)
+        mask *= max(1.0 + 1.8 * rim * band - cen * (1.0 - hot), 0.02);
+    }
+
+    // Mechanical vignetting: at a field angle the barrel rims project onto the pupil, and what
+    // survives is the overlap of the pupil with an offset circle of the same size - a vesica, not a
+    // disc. lenssimulator.photo ray-traces published patents and measures the same thing: a Helios
+    // 44-2 is 61% round in the 90% corner at f/2, and 95% at f/4, because stopping down pulls the
+    // iris inside the rims.
+    float catEye = saturate(ApertureCatEye);
+    if (catEye > 0.0)
+    {
+        // Offset in pupil radii. The range covers the traced corners: 0.62 is a Helios 44-2 at f/2
+        // (61% of the pupil left), 0.72 a Noct 58/0.95 (55%), 0.85 a Canon RF 85/1.2 (48%).
+        // Stopping down pulls the iris inside the rims, so the bite falls with the pupil area: at
+        // the traced fall-off that takes the Helios from 61% to 95% over two stops, which this
+        // gives as 48% -> 87%. The clamp stops the strongest setting short of a sliver.
+        float ap  = ApertureSize / 0.35;
+        float u   = min(0.85 * catEye * ap * ap, 0.90);
+        float ang = radians(ApertureCatEyeAngle);
+        float2 q  = d * (2.0 / max(ApertureSize, 1e-4)) - float2(cos(ang), sin(ang)) * u;
+        // The rim sits well away from the pupil plane, so its projected edge is defocused: wider
+        // than the blade edge, which also keeps the cusp diffraction from reading as streaks.
+        float rimSoft = clamp(3.0 * soft, 0.01, 0.35);
+        mask *= 1.0 - smoothstep(1.0 - rimSoft, 1.0 + 0.5 * rimSoft, length(q));
+    }
 
     return max(mask, 0.0);
 }
@@ -642,8 +714,11 @@ float BakeSignature()
     s = HashStep(s, (float)ApertureSides / 32.0);
     s = HashStep(s, ApertureBladeCurvature);
     s = HashStep(s, ApertureSoftness / 0.9);
-    s = HashStep(s, ApertureFalloff);
+    s = HashStep(s, ApertureRim);
+    s = HashStep(s, ApertureCentre);
     s = HashStep(s, ApertureRing / 0.95);
+    s = HashStep(s, ApertureCatEye);
+    s = HashStep(s, (ApertureCatEyeAngle + 180.0) / 360.0);
     s = HashStep(s, ApertureDispersion / 0.5);
     s = HashStep(s, ApertureSize / 0.6);
     s = HashStep(s, ApertureBeamGain / 8.0);
@@ -992,7 +1067,34 @@ void BakeApertureCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThrea
     if (LensDirtStrength > 0.0)
     {
 
-        float2 duv = d / max(ApertureSize, 1e-4) * max(LensDirtTiling, 0.05) + 0.5;
+        float  tiling = max(LensDirtTiling, 0.05);
+        float2 duv;
+
+        if (tiling > 1.0)
+        {
+            // Tiling repeats the map, and at 2x the same specks show up four times across the pupil.
+            // Give each tile its own hashed offset and quarter turn instead: the dust is sparse on a
+            // clean field, so the boundary between two unrelated tiles reads as a fresh patch of
+            // dirt rather than as a seam, and the repeat is gone. One hash per bake texel.
+            float2 tiled = d / max(ApertureSize, 1e-4) * tiling + 0.5;
+            float2 cell  = floor(tiled);
+            float2 f     = frac(tiled) - 0.5;
+
+            float2 h = frac(sin(float2(dot(cell, float2(127.1, 311.7)),
+                                       dot(cell, float2(269.5, 183.3)))) * 43758.5453);
+
+            float turn = floor(h.x * 4.0);
+            if      (turn == 1.0) f = float2(-f.y,  f.x);
+            else if (turn == 2.0) f = float2(-f.x, -f.y);
+            else if (turn == 3.0) f = float2( f.y, -f.x);
+
+            duv = frac(f + 0.5 + h.yx);
+        }
+        else
+        {
+            duv = d / max(ApertureSize, 1e-4) * tiling + 0.5;
+        }
+
         float dust = Luminance(tex2Dlod(sLensDirt, float4(duv, 0.0, 0.0)).rgb);
 
         dirt = lerp(1.0, saturate(dust * LensDirtGain), saturate(LensDirtStrength));

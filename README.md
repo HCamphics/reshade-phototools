@@ -6,8 +6,8 @@ A ReShade shader collection for in-game photography.
 ## Contents
 
 **FFT Bloom** - a from-scratch implementation of Unreal Engine's bloom convolution, plus
-extensions: a procedural aperture kernel, spectral dispersion, beam emphasis, and lens dust that
-scatters the light.
+extensions: a procedural aperture kernel (blades, cat's eye, soap-bubble and hot-centre pupil
+weighting), spectral dispersion, beam emphasis, and lens dust that scatters the light.
 
 Two effects share one implementation (`UE_FFTBloom_Common.fxh`) and differ only in where the
 kernel comes from:
@@ -31,6 +31,9 @@ The dust map in `Textures/LensDirt` is a transmission map also made by yours tru
 
 Merge `reshade-shaders/` into the game's ReShade folder. The shaders sit in
 `Shaders/HCamphicsPhotoTools/`.
+
+Presets written for earlier versions set uniforms that no longer exist. ReShade logs them as unknown
+and falls back to the defaults, so re-save the preset once to clear the log.
 
 ## Licence
 
