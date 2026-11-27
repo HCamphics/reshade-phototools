@@ -9,11 +9,11 @@ A ReShade shader collection for in-game photography.
 extensions: a procedural aperture kernel (blades, cat's eye, soap-bubble and hot-centre pupil
 weighting), spectral dispersion, beam emphasis, and lens dust that scatters the light.
 
-Two effects share one implementation (`UE_FFTBloom_Common.fxh`) and differ only in where the
+Two effects share one implementation (`HC_FFTBloom_Common.fxh`) and differ only in where the
 kernel comes from:
 
-- `UE_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls.
-- `UE_FFTBloom.fx` — the kernel is read from a DDS kernel in `reshade-shaders/Textures/Kernels`.
+- `HC_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls.
+- `HC_FFTBloom.fx` — the kernel is read from a DDS kernel in `reshade-shaders/Textures/Kernels`.
 
 Enable one or the other. The DDS effect needs the
 `Kernels` folder; the aperture effect does not.

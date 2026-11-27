@@ -1,6 +1,6 @@
 /*==============================================================================
 
-    UE FFT Bloom - kernel texture
+    HC FFT Bloom - procedural aperture
 
     Licence: CC BY-NC 4.0 - see LICENSE in the repository root.
     TODO: overview (HCamphics)
@@ -13,5 +13,5 @@
     #define FTB_QUALITY 0
 #endif
 
-#define KERNEL_MODE 0
-#include "UE_FFTBloom_Common.fxh"
+#define KERNEL_MODE 1
+#include "HC_FFTBloom_Common.fxh"
