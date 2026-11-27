@@ -20,9 +20,10 @@
                  inverse FFT -> composite (+ lens dirt)
     Per kernel:  pupil -> dispersion -> FFT -> energy + phase normalisation
 
-    Intensity is Unreal-style: it mixes scene -> bloom, so 1.0 is pure bloom and
-    above that does nothing. Beam Emphasis and Spike * are artistic, not optical;
-    the rest of the aperture group is aperture geometry.
+    Blend Mode decides how the glow meets the scene: Additive (the default) is the
+    physical one - scattered light adds to the image - while Lerp is Unreal's
+    artistic composite, where Intensity mixes scene into glow. Beam Emphasis is
+    artistic, not optical; the rest of the aperture group is aperture geometry.
 
     Limits
         - Bloom runs on the tonemapped LDR frame, so clipped highlights have
@@ -33,9 +34,7 @@
 
     TODO
         - HDR input path (no HDR display to test on)
-        - kernel spectrum cache: needs KernelPrep as a compute pass, because a
-          pixel pass that returns early leaves its targets undefined
-        - dust scatter term, one-sided anamorphic streak, depth-faded bloom
+        - one-sided anamorphic streak, depth-faded bloom
 
 ==============================================================================*/
 #include "ReShade.fxh"
@@ -50,8 +49,21 @@
     #define KERNEL_MODE 0
 #endif
 
-// Dispersion samples used when baking the procedural PSF. Bake-time only.
-#define BAKE_DISP_STEPS 16
+// Quality tier. Anything that adds or removes passes, textures or dispatch sizes has to be gated
+// here, because ReShade builds a fixed pass list at load time and a uniform can never skip a pass.
+// Set it per effect: ReShade overlay -> the effect's ... menu -> Edit preprocessor definitions, or
+// the preset line PreprocessorDefinitions=FTB_QUALITY=1,
+#ifndef FTB_QUALITY
+    #define FTB_QUALITY 0
+#endif
+
+// Dispersion samples used when baking the procedural PSF. Bake-time only, so a higher count costs
+// a slower first bake and never frame time.
+#if FTB_QUALITY >= 1
+    #define BAKE_DISP_STEPS 64
+#else
+    #define BAKE_DISP_STEPS 16
+#endif
 
 #ifndef FFT_SIZE
     #define FFT_SIZE 512
@@ -68,6 +80,11 @@
 #endif
 
 #define FFT_THREADS   (FFT_SIZE / 2)
+// Threads in the kernel-sum reduction. Changing it means changing one line, but it has to stay in
+// step everywhere it is used: the groupshared array, the loop stride, the reduction start and the
+// group size in the pass below. A mismatch is silently wrong, not a compile error.
+#define KERNEL_SUM_THREADS 256
+#define DUST_SUM_THREADS 256
 #define RCP_FFT_SIZE  (1.0 / FFT_SIZE)
 #define INV_SQRT_N    rsqrt((float)FFT_SIZE)
 
@@ -144,7 +161,7 @@ uniform float Threshold <
     ui_type = "drag"; ui_min = -1.0; ui_max = 5.0; ui_step = 0.01;
     ui_category = "Bloom";
     ui_label = "Threshold";
-    ui_tooltip = "Luminance above which pixels bloom. -1 removes the threshold so everything contributes, which is the physically based behaviour of Unreal convolution bloom.";
+    ui_tooltip = "Luminance above which pixels bloom. -1 removes the threshold so everything contributes, which is Unreal's physically based convolution bloom.";
 > = -1.0;
 
 uniform float SoftKnee <
@@ -154,18 +171,11 @@ uniform float SoftKnee <
     ui_tooltip = "Softens the threshold transition. Inactive while Threshold is -1.";
 > = 0.5;
 
-uniform float ExposureEV <
-    ui_type = "drag"; ui_min = -5.0; ui_max = 5.0; ui_step = 0.01;
-    ui_category = "Bloom";
-    ui_label = "Exposure Bias";
-    ui_tooltip = "Stops of exposure applied to the bloom input before the threshold, so it decides which pixels qualify. The scene is untouched.";
-> = 0.0;
-
 uniform float HighlightShoulder <
     ui_type = "drag"; ui_min = 0.0; ui_max = 0.9; ui_step = 0.01;
     ui_category = "Bloom";
     ui_label = "Highlight Shoulder";
-    ui_tooltip = "Rolls off the bloom input with c/(1 + s*c) before the threshold, so a clipped white pixel and a much brighter source no longer bloom identically. 0 = off; 0.2-0.5 is a sensible range for LDR games.";
+    ui_tooltip = "Rolls the bloom input off with c/(1 + s*c) before the threshold, so a clipped white and a much brighter source do not bloom identically. 0 = off; 0.2-0.5 suits LDR games.";
 > = 0.0;
 
 uniform int BlendMode <
@@ -173,8 +183,8 @@ uniform int BlendMode <
     ui_items = "Lerp (Unreal Style)\0Additive\0Screen\0";
     ui_category = "Bloom";
     ui_label = "Blend Mode";
-    ui_tooltip = "Lerp blends scene and glow by Intensity, the way Unreal's bloom composite does; Intensity is the blend amount, so 1 means glow only. Additive adds the glow and lets Intensity go above 1. Screen brightens without clipping.";
-> = 0;
+    ui_tooltip = "Additive is the physically correct one: scattered light adds, so Intensity is a gain and may exceed 1. Lerp is Unreal's artistic mix (1 = glow only). Screen brightens without clipping; additive reaches white first on LDR.";
+> = 1;
 
 uniform float KernelScale <
     ui_type = "drag"; ui_min = 0.05; ui_max = 3.0; ui_step = 0.01;
@@ -203,24 +213,16 @@ uniform int KernelFile <
     ui_items = "DecagonApertureDirty\0DirtyStreak\0HeptagonApertureDirty\0HumanEye\0MovieLens\0PhoneCamera1\0PhoneCamera2\0Streak\0";
     ui_category = "Kernel";
     ui_label = "Kernel File";
-    ui_tooltip = "DDS file to convolve with, from reshade-shaders/Textures/Kernels. The list is edited at the top of this shader. Aperture effect bakes its own PSF, so this only affects this effect.";
+    ui_tooltip = "DDS file to convolve with, from reshade-shaders/Textures/Kernels. The list is declared at the top of this shader; the aperture effect bakes its own PSF instead.";
 > = 0;
 #endif
 
 #if KERNEL_MODE == 1
-uniform int AperturePreset <
-    ui_type = "combo";
-    ui_items = "Custom\0Circle\0Hexagon\0Heptagon\0Octagon\0Nonagon\0Decagon\0Hendecagon\0Dodecagon\0";
-    ui_category = "Aperture";
-    ui_label = "Preset";
-    ui_tooltip = "Built-in blade counts, 6 to 12 blades. Custom uses the Sides slider, 3 to 24.";
-> = 0;
-
 uniform int ApertureSides <
-    ui_type = "drag"; ui_min = 3; ui_max = 24; ui_step = 1;
+    ui_type = "drag"; ui_min = 3; ui_max = 32; ui_step = 1;
     ui_category = "Aperture";
     ui_label = "Sides";
-    ui_tooltip = "Blade count, used only when Preset is Custom. The named presets set their own count.";
+    ui_tooltip = "Blade count. 32 blades with Blade Curvature 1 is a smooth circle; fewer sides with 0 curvature give the sharp polygon corners that produce diffraction spikes.";
 > = 6;
 
 uniform float ApertureBladeCurvature <
@@ -251,34 +253,6 @@ uniform float ApertureRing <
     ui_tooltip = "Removes the aperture centre, giving the donut bokeh of a catadioptric lens.";
 > = 0.0;
 
-uniform int ApertureSpikes <
-    ui_type = "drag"; ui_min = 0; ui_max = 24; ui_step = 1;
-    ui_category = "Aperture";
-    ui_label = "Spike Count";
-    ui_tooltip = "Adds radial diffraction spikes on top of the aperture shape. 0 = off. Sharp blades already produce spikes at low Edge Softness.";
-> = 0;
-
-uniform float ApertureSpikeStrength <
-    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-    ui_category = "Aperture";
-    ui_tooltip = "Brightness of the added spikes.";
-    ui_label = "Spike Strength";
-> = 0.25;
-
-uniform float ApertureSpikeLength <
-    ui_type = "drag"; ui_min = 0.5; ui_max = 8.0; ui_step = 0.1;
-    ui_category = "Aperture";
-    ui_tooltip = "How far the added spikes reach from the centre.";
-    ui_label = "Spike Length";
-> = 2.5;
-
-uniform float3 ApertureTint <
-    ui_type = "color";
-    ui_category = "Aperture";
-    ui_label = "Tint";
-    ui_tooltip = "Colours the aperture. DDS kernels carry their own colour, this does the same for the analytic shapes.";
-> = float3(1.0, 1.0, 1.0);
-
 uniform float ApertureDispersion <
     ui_type = "drag"; ui_min = 0.0; ui_max = 0.5; ui_step = 0.005;
     ui_category = "Aperture";
@@ -290,14 +264,14 @@ uniform float ApertureSize <
     ui_type = "drag"; ui_min = 0.005; ui_max = 0.6; ui_step = 0.001;
     ui_category = "Aperture";
     ui_label = "Size";
-    ui_tooltip = "Aperture radius relative to the transform grid. Smaller = wider diffraction and a bigger glow, like stopping down, but below about 0.2 the pupil is under-resolved on the 512 grid and the pattern aliases into a lattice. 0.35-0.5 gives a clean star.";
+    ui_tooltip = "Aperture radius on the transform grid. Smaller means wider diffraction and a bigger glow, like stopping down, but below about 0.2 the pupil is under-resolved and the pattern aliases into a lattice. 0.35-0.5 gives a clean star.";
 > = 0.35;
 
 uniform float ApertureBeamGain <
     ui_type = "drag"; ui_min = 1.0; ui_max = 8.0; ui_step = 0.05;
     ui_category = "Aperture";
     ui_label = "Beam Emphasis";
-    ui_tooltip = "A clean 7-blade pupil puts its rays at roughly 2e-5 of the core peak, which is invisible on an LDR game. 2, the default, lifts them to about 0.5% (15/255) while the far field stays black. 3+ starts lifting the whole tail into a grey haze.";
+    ui_tooltip = "A clean 7-blade pupil puts its rays near 2e-5 of the core peak, invisible on an LDR game. 2 lifts them to about 0.5% while the far field stays black; 3+ lifts the whole tail into a grey haze.";
 > = 2.0;
 #endif
 
@@ -308,21 +282,38 @@ uniform float3 BloomTint <
     ui_tooltip = "Colours the glow. White keeps the kernel's own chromatic diffraction intact.";
 > = float3(1.0, 1.0, 1.0);
 
+// Post-processing of the finished kernel, so it sits next to Tint rather than with the controls that
+// shape the pupil. Per channel: dispersion gives the kernel its colour, and a grey Levels curve does
+// not flatten that - it moves each channel on its own, so saturation shifts as it does on a photo.
+uniform float KernelDehaze <
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_category = "Color";
+    ui_label = "Kernel Dehaze";
+    ui_tooltip = "Dehazes the kernel with Photoshop's Levels midtone curve (1.0 down to 0.5): the haze between the rays drops away and colour is kept, since it works per channel. Artistic, not physical. 0 = off.";
+> = 0.0;
+
 #if KERNEL_MODE == 1
 
 uniform float LensDirtStrength <
     ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Lens Dirt";
     ui_label = "Lens Dirt";
-    ui_tooltip = "How strongly the dust map modulates the pupil before it is diffracted, so each speck scatters light the way real dust on the front element does. It can only dim inside the aperture, never add glow outside it. 0 = clean lens.";
+    ui_tooltip = "How strongly the dust map modulates the pupil before it is diffracted. With Dust Scatter above 0, the light it blocks comes back as veiling glare instead of just a dimmer pupil. 0 = clean lens.";
 > = 0.0;
 
 uniform float LensDirtGain <
     ui_type = "drag"; ui_min = 1.0; ui_max = 8.0; ui_step = 0.1;
     ui_category = "Lens Dirt";
     ui_label = "Dust Gain";
-    ui_tooltip = "Brightens the dust photo before use. Dust maps are dark, dirt1.png averages 0.21, so 4 puts it near 0.85.";
+    ui_tooltip = "Brightens the dust map before it attenuates the pupil. The map is transmission, so bright means clean: it averages 0.84, and 4 leaves everything but the specks untouched.";
 > = 4.0;
+
+uniform float LensDirtScatter <
+    ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_category = "Lens Dirt";
+    ui_label = "Dust Scatter";
+    ui_tooltip = "Energy conservation: the light the dust blocks is re-emitted over a wide angle, so it becomes a faint lift across the frame plus a wide halo instead of a dimmer pupil. Baked into the PSF, so it costs nothing per frame. 0 = off.";
+> = 0.0;
 
 uniform float LensDirtTiling <
     ui_type = "drag"; ui_min = 0.25; ui_max = 4.0; ui_step = 0.05;
@@ -334,11 +325,11 @@ uniform float LensDirtTiling <
 
 uniform int DebugView <
     ui_type = "combo";
-    ui_items = "Final Composite\0Bloom Only\0Pre-Filtered Input\0Kernel\0Spectrum Magnitude\0Quadrants\0Capture Test\0Pupil\0Bake Spectrum\0";
+    ui_items = "Final Composite\0Bloom Only\0Pre-Filtered Input\0Pupil + Kernel\0Spectrum Magnitude\0Quadrants\0Bake Spectrum\0";
     ui_category = "Debug";
     ui_category_closed = true;
     ui_label = "Debug View";
-    ui_tooltip = "Kernel shows the PSF at a normalised exposure. Leave at Final Composite for normal play.";
+    ui_tooltip = "3 shows the pupil and the kernel side by side. Leave at Final Composite for normal play.";
 > = 0;
 
 // ==========================================================================
@@ -352,8 +343,6 @@ texture TexKernelB  { Width = FFT_SIZE; Height = FFT_SIZE; Format = SPEC_FMT; };
 
 sampler sImageA  { Texture = TexImageA;  AddressU = CLAMP; AddressV = CLAMP; };
 sampler sImageB  { Texture = TexImageB;  AddressU = CLAMP; AddressV = CLAMP; };
-sampler sKernelA { Texture = TexKernelA; AddressU = CLAMP; AddressV = CLAMP; };
-sampler sKernelB { Texture = TexKernelB; AddressU = CLAMP; AddressV = CLAMP; };
 
 storage2D stImageA  { Texture = TexImageA;  };
 storage2D stImageB  { Texture = TexImageB;  };
@@ -363,6 +352,21 @@ storage2D stKernelB { Texture = TexKernelB; };
 texture TexKernelEnergy { Width = 1; Height = 1; Format = RGBA32F; };
 sampler sKernelEnergy   { Texture = TexKernelEnergy; };
 storage2D stKernelEnergy { Texture = TexKernelEnergy; };
+
+// The signature lives in its own 1x1 texture so no pass ever reads a texel it also writes.
+// Having KernelFFTYCS read TexKernelEnergy and write it back in the same pass is undefined
+// behaviour in D3D11 (the SRV is bound alongside the UAV) and zeroed energy and peak under
+// DXVK, which made the whole bloom composite multiply by zero.
+texture TexKernelState  { Width = 1; Height = 1; Format = RGBA32F; };
+sampler sKernelState    { Texture = TexKernelState; };
+storage2D stKernelState { Texture = TexKernelState; };
+
+// Mean fraction of the aperture blocked by dust, reduced once per bake and used by the PSF pass to
+// size the veiling-glare wing. Kept in its own texture because TexBakeState is read by BakeNeeded()
+// in every bake pass, and writing a texel a pass also reads is undefined in D3D11.
+texture TexDustMean { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sDustMean   { Texture = TexDustMean; };
+storage2D stDustMean { Texture = TexDustMean; };
 
 #if KERNEL_MODE == 0
 
@@ -449,7 +453,7 @@ storage2D stBakeState   { Texture = TexBakeState; };
 
 // Width/Height must be declared: a source texture is created at the annotated size
 // (1x1 by default) and the image is resized to it.
-texture TexLensDirt < source = LENS_DIRT_TEXTURE; > { Width = 512; Height = 512; Format = RGBA8; };
+texture TexLensDirt < source = LENS_DIRT_TEXTURE; > { Width = 1024; Height = 1024; Format = RGBA8; };
 
 sampler sLensDirt
 {
@@ -465,6 +469,21 @@ sampler sLensDirt
 // ==========================================================================
 //  maths and helpers
 // ==========================================================================
+
+// Signature hash for the caches below. A slider step must move the result by far more than float
+// noise: the smallest step contributes ~2e-4, while a difference in FMA contraction between two
+// entry points is ~1e-7. The comparison is tolerant, so exact bit reproducibility is not needed.
+// The earlier s = s*3.17 + v chain grew to ~3e6, where one ulp is 0.25 and the last parameters
+// moved the result by only 1-2 ulp - too close to the noise floor for a cache to compare.
+float HashStep(float s, float v)
+{
+    return frac(s * 3.17 + v * 0.7331);
+}
+
+bool SignatureChanged(float stored, float fresh)
+{
+    return abs(stored - fresh) > 1e-5;
+}
 
 float2 ComplexMul(float2 a, float2 b)
 {
@@ -495,8 +514,13 @@ float3 LinearToSRGB(float3 c)
 
 float3 SRGBToLinear(float3 c)
 {
-    c = max(c, 0.0);
+    // sopt found the clamp is dead code: on an 8-bit SDR swapchain every channel is already in
+    // [0,1]. Kept behind the guard so an HDR swapchain still clamps.
+#if BUFFER_COLOR_SPACE <= 1
     return pow(c, 2.2);
+#else
+    return pow(max(c, 0.0), 2.2);
+#endif
 }
 
 float2 ContentSize()
@@ -540,7 +564,9 @@ float3 SceneLinear(float2 uv)
 
 float3 PrefilterLinear(float3 linearColor, float2 uv)
 {
-    float3 c = linearColor * exp2(ExposureEV);
+    // No exposure gain here: multiplying before the threshold and dividing again in the composite
+    // cancels exactly once Threshold is -1, so the control would look inert at its default.
+    float3 c = linearColor;
 
     if (HighlightShoulder > 0.0)
         c = c / (1.0 + HighlightShoulder * c);
@@ -557,7 +583,8 @@ float3 PrefilterLinear(float3 linearColor, float2 uv)
         w = max(rq, L - Threshold) / max(L, 1e-5);
     }
 
-    return max(c * w, 0.0);
+    // sopt: c is in [0,1] and w in [0, 1.7e10], so the clamp can never trigger (bit-exact).
+    return c * w;
 }
 
 #if KERNEL_MODE == 1
@@ -567,20 +594,8 @@ float3 PrefilterLinear(float3 linearColor, float2 uv)
 
 void ApertureParams(out float sides, out float curvature)
 {
-    sides = (float)ApertureSides;
+    sides = clamp((float)ApertureSides, 3.0, 32.0);
     curvature = ApertureBladeCurvature;
-
-    if (AperturePreset == 1)
-    {
-        sides = 32.0;
-        curvature = 1.0;
-    }
-    else if (AperturePreset >= 2)
-    {
-        sides = (float)(AperturePreset + 4);
-    }
-
-    sides = clamp(sides, 3.0, 64.0);
 }
 
 float ApertureMask(float2 d)
@@ -612,17 +627,6 @@ float ApertureMask(float2 d)
     if (falloff > 0.0)
         mask *= lerp(1.0, exp(-2.5 * rn * rn), falloff);
 
-    if (ApertureSpikes > 0)
-    {
-        float sn = (float)clamp(ApertureSpikes, 1, 32);
-        float sSector = TAU / sn;
-        float sa = th - sSector * floor(th / sSector + 0.5);
-        float t = sa / (0.12 * sSector);
-        float angFall = exp(-t * t);
-        float radial = exp(-max(ApertureSpikeLength, 0.1) * radius);
-        mask += saturate(ApertureSpikeStrength) * angFall * radial;
-    }
-
     return max(mask, 0.0);
 }
 
@@ -632,32 +636,33 @@ float ApertureMask(float2 d)
 
 float BakeSignature()
 {
-    float s = 1.0;
-    s = s * 3.17 + (float)AperturePreset;
-    s = s * 3.17 + (float)ApertureSides;
-    s = s * 3.17 + ApertureBladeCurvature;
-    s = s * 3.17 + ApertureSoftness;
-    s = s * 3.17 + ApertureFalloff;
-    s = s * 3.17 + ApertureRing;
-    s = s * 3.17 + (float)ApertureSpikes;
-    s = s * 3.17 + ApertureSpikeStrength;
-    s = s * 3.17 + ApertureSpikeLength;
-    s = s * 3.17 + ApertureDispersion;
-    s = s * 3.17 + ApertureSize;
-    s = s * 3.17 + ApertureBeamGain;
+    // Every term is normalised to its slider range first, so the accumulator stays in [0, 1] and a
+    // single-step change is always far above the comparison tolerance.
+    float s = 0.5;
+    s = HashStep(s, (float)ApertureSides / 32.0);
+    s = HashStep(s, ApertureBladeCurvature);
+    s = HashStep(s, ApertureSoftness / 0.9);
+    s = HashStep(s, ApertureFalloff);
+    s = HashStep(s, ApertureRing / 0.95);
+    s = HashStep(s, ApertureDispersion / 0.5);
+    s = HashStep(s, ApertureSize / 0.6);
+    s = HashStep(s, ApertureBeamGain / 8.0);
 
-    s = s * 3.17 + LensDirtStrength;
-    s = s * 3.17 + LensDirtGain;
-    s = s * 3.17 + LensDirtTiling;
-    s = s * 3.17 + (float)BAKE_DISP_STEPS;
-    return s;
+    s = HashStep(s, LensDirtStrength);
+    s = HashStep(s, LensDirtGain / 8.0);
+    s = HashStep(s, LensDirtTiling / 4.0);
+    s = HashStep(s, LensDirtScatter);
+    s = HashStep(s, (float)BAKE_DISP_STEPS / 64.0);
+
+    // Offset away from zero: a freshly created (zeroed) state texture must always read as changed.
+    return 0.5 + 0.5 * s;
 }
 #endif
 
 bool BakeNeeded()
 {
 #if KERNEL_MODE == 1
-    return tex2Dlod(sBakeState, float4(0.5, 0.5, 0.0, 0.0)).x != BakeSignature();
+    return SignatureChanged(tex2Dlod(sBakeState, float4(0.5, 0.5, 0.0, 0.0)).x, BakeSignature());
 #else
     return false;
 #endif
@@ -667,28 +672,59 @@ bool BakeNeeded()
 // appear to do nothing.
 float KernelSignature()
 {
-    float s = 1.0;
-    s = s * 3.17 + KernelScale;
-    s = s * 3.17 + KernelRotation;
-    s = s * 3.17 + AnamorphicStretch;
+    float s = 0.5;
+    s = HashStep(s, KernelScale / 3.0);
+    s = HashStep(s, (KernelRotation + 180.0) / 360.0);
+    s = HashStep(s, AnamorphicStretch / 4.0);
+    s = HashStep(s, KernelDehaze);
 #if KERNEL_MODE == 0
-    s = s * 3.17 + (float)KernelFile;
+    s = HashStep(s, (float)KernelFile / 8.0);
 #else
-    s = s * 3.17 + ApertureTint.r;
-    s = s * 3.17 + ApertureTint.g;
-    s = s * 3.17 + ApertureTint.b;
-
-    s = s * 3.17 + BakeSignature();
+    s = HashStep(s, BakeSignature());
 #endif
-    return s;
+    return 0.5 + 0.5 * s;
 }
 
 bool KernelNeeded()
 {
-    // TEMPORARY: returns true unconditionally. The cache is only safe once KernelPrep is a
-    // compute pass - a pixel shader that returns without writing leaves its render targets
-    // undefined, which zeroed the kernel spectrum while the cached passes skipped.
-    return true;
+    // True when any control that shapes the kernel changed since the spectrum was last built.
+    // Every pass in the kernel chain is compute, so skipping its writes is safe: the previous
+    // spectrum simply stays in TexKernelA/B. A pixel shader here would leave its render targets
+    // undefined instead (AMD zeroes them), which is what broke the cache before.
+    return SignatureChanged(tex2Dlod(sKernelState, float4(0.5, 0.5, 0.0, 0.0)).x, KernelSignature());
+}
+
+// Note: computing these two decisions once per frame in a dedicated pass was tried and MEASURED
+// as a regression - the extra 1-thread dispatch cost 0.017 ms under DXVK, more than the ~0.014 ms
+// of per-thread hashing it saved. Keep the hashes in the gated passes unless the dispatch cost
+// changes.
+
+// Photoshop's Levels midtone response, verified against a Photoshop LUT rather than derived:
+// midtone 0.5 is exactly u^2 on 0..1 (every level of the reference LUT matched, 0 mismatches;
+// floor(v^2/255) was off by one level on 55 of them). That is the u^(1/gamma) form PhotoCraft uses
+// (crates/compose/src/adjust/tone.rs, levels_gamma); their shadow-toe branch only applies above
+// gamma 1, and this control stops at 0.5 -> 1.0, so it is unreachable here.
+float LevelsMidtone(float u, float midtone)
+{
+    return pow(saturate(u), 1.0 / max(midtone, 0.05));
+}
+
+// The kernel is convolved in linear light, but Levels is a curve pulled on a display-encoded image
+// - which is also exactly what the DDS kernels are. Convert, curve, convert back; with Kernel Dehaze at 0
+// none of this runs and SampleKernel is unchanged. Applied per channel, so the colour the dispersion
+// bake put in the kernel is preserved as colour (each channel moves by a different amount) instead of
+// being flattened to a single luminance curve.
+float3 DehazeKernel(float3 k)
+{
+    if (KernelDehaze <= 0.0)
+        return k;
+
+    float  midtone = 1.0 - 0.5 * saturate(KernelDehaze);   // slider 0 -> 1.0, 1 -> 0.5
+    float3 d = pow(saturate(k), 1.0 / 2.2);
+    d = float3(LevelsMidtone(d.r, midtone),
+               LevelsMidtone(d.g, midtone),
+               LevelsMidtone(d.b, midtone));
+    return pow(d, 2.2);
 }
 
 float3 SampleKernel(float2 gridUV)
@@ -706,7 +742,7 @@ float3 SampleKernel(float2 gridUV)
 #if KERNEL_MODE == 1
 
     float3 k = tex2Dlod(sApertureKernel, float4(frac(0.5 + d), 0.0, 0.0)).rgb;
-    return max(k, 0.0) * max(ApertureTint, 0.0);
+    return DehazeKernel(max(k, 0.0));
 #else
     float2 kuv = frac(0.5 + d);
 
@@ -719,7 +755,8 @@ float3 SampleKernel(float2 gridUV)
     else if (KernelFile == 6) k = tex2Dlod(sBloomKernel6, float4(kuv, 0.0, 0.0)).rgb;
     else if (KernelFile == 7) k = tex2Dlod(sBloomKernel7, float4(kuv, 0.0, 0.0)).rgb;
     else                      k = tex2Dlod(sBloomKernel0, float4(kuv, 0.0, 0.0)).rgb;
-    return pow(max(k, 0.0), 2.2);
+    // sopt: an 8-bit kernel texture read is in [0,1], so the clamp is dead code (bit-exact).
+    return DehazeKernel(pow(k, 2.2));
 #endif
 }
 
@@ -798,18 +835,7 @@ void FFTStages2Bake(uint lane, bool forward) { FFTStages2N(lane, BAKE_SIZE, LOG2
 //  kernel spectrum
 // ==========================================================================
 
-void KernelPrepPS(float4 vpos : SV_Position, float2 uv : TEXCOORD0,
-                  out float4 o0 : SV_Target0, out float4 o1 : SV_Target1)
-{
-    if (!KernelNeeded())
-        return;
-
-    float3 k = SampleKernel(uv);
-    o0 = float4(k.r, 0.0, k.g, 0.0);
-    o1 = float4(k.b, 0.0, 0.0, 0.0);
-}
-
-groupshared float2 g_kernel_stats[256];
+groupshared float2 g_kernel_stats[KERNEL_SUM_THREADS];
 
 [shader("compute")]
 void KernelSumCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
@@ -822,20 +848,21 @@ void KernelSumCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
     float acc = 0.0;
     float mx  = 0.0;
     const uint count = FFT_SIZE * FFT_SIZE;
-    for (uint i = tid; i < count; i += 256u)
+    for (uint i = tid; i < count; i += KERNEL_SUM_THREADS)
     {
-        int2 p = int2((int)(i % FFT_SIZE), (int)(i / FFT_SIZE));
-        float4 a = tex2Dfetch(stKernelA, p);
-        float4 b = tex2Dfetch(stKernelB, p);
-        float v = (a.x + a.z + b.x) / 3.0;
-        acc += v;
-        mx = max(mx, max(a.x, max(a.z, b.x)));
+        // Sample the PSF here instead of fetching a prepared copy. The old KernelPrep pixel pass
+        // existed only to give this reduction something to read - a full grid pass plus a render
+        // target pair - and it made the cache unsafe. The FFT passes sample the kernel the same way.
+        float2 g = (float2((int)(i % FFT_SIZE), (int)(i / FFT_SIZE)) + 0.5) * RCP_FFT_SIZE;
+        float3 k = SampleKernel(g);
+        acc += (k.r + k.g + k.b) / 3.0;
+        mx   = max(mx, max(k.r, max(k.g, k.b)));
     }
 
     g_kernel_stats[tid] = float2(acc, mx);
     barrier();
 
-    for (uint s = 128u; s > 0u; s >>= 1)
+    for (uint s = KERNEL_SUM_THREADS / 2u; s > 0u; s >>= 1)
     {
         if (tid < s)
         {
@@ -851,7 +878,9 @@ void KernelSumCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
         float energy = (mean > 1e-8) ? (1.0 / ((float)FFT_SIZE * mean)) : 1.0;
 
         float peak = max(g_kernel_stats[0].y, 1e-8);
-        tex2Dstore(stKernelEnergy, int2(0, 0), float4(energy, peak, KernelSignature(), 0.0));
+        // Energy and peak only. The signature is committed by the last pass of the chain, in its
+        // own texture, so nothing here reads a texel this pass writes.
+        tex2Dstore(stKernelEnergy, int2(0, 0), float4(energy, peak, 0.0, 0.0));
     }
 }
 
@@ -940,6 +969,9 @@ void KernelFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadI
         tex2Dstore(stKernelB, int2((int)col, (int)k4), float4(b.x, b.y, 0.0, 0.0));
     }
     barrier();
+
+    // The signature commit lives in its own pass (KernelCommitCS) so this one never writes the
+    // 1x1 texel that KernelNeeded() reads.
 }
 
 #if KERNEL_MODE == 1
@@ -982,6 +1014,58 @@ void BakeApertureCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThrea
     tex2Dstore(stBakeA, p, float4(mR, 0.0, mG, 0.0));
 
     tex2Dstore(stPupil, p, float4(mR, mG, mB, dirt));
+}
+
+groupshared float2 g_dust_stats[DUST_SUM_THREADS];
+
+// Mean fraction of the aperture that dust blocks. Scatter is incoherent, so the veiling wing needs
+// a global figure - a per-texel value has no meaning in PSF space, which is the whole point of the
+// transform. Reduced here, once per bake, so it costs nothing per frame.
+void DustSumCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    if (!BakeNeeded())
+        return;
+
+    uint tid = gtid.x;
+
+    if (LensDirtScatter <= 0.0)
+    {
+        if (tid == 0)
+            tex2Dstore(stDustMean, int2(0, 0), float4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float blocked = 0.0;
+    float weight  = 0.0;
+
+    const uint count = BAKE_SIZE * BAKE_SIZE;
+    for (uint i = tid; i < count; i += DUST_SUM_THREADS)
+    {
+        int2   p   = int2((int)(i % BAKE_SIZE), (int)(i / BAKE_SIZE));
+        float4 pup = tex2Dfetch(stPupil, p);                  // rgb = mask * dirt, a = dirt
+        float  dust = pup.a;
+        float  md   = max(pup.r, max(pup.g, pup.b));          // mask attenuated by the dust
+        float  mask = (dust > 1e-4) ? saturate(md / dust) : 0.0;
+
+        blocked += (1.0 - dust) * mask;
+        weight  += mask;
+    }
+
+    g_dust_stats[tid] = float2(blocked, weight);
+    barrier();
+
+    for (uint s = DUST_SUM_THREADS / 2u; s > 0u; s >>= 1)
+    {
+        if (tid < s)
+            g_dust_stats[tid] += g_dust_stats[tid + s];
+        barrier();
+    }
+
+    if (tid == 0)
+    {
+        float mean = (g_dust_stats[0].y > 1e-6) ? (g_dust_stats[0].x / g_dust_stats[0].y) : 0.0;
+        tex2Dstore(stDustMean, int2(0, 0), float4(saturate(mean), 0.0, 0.0, 0.0));
+    }
 }
 
 [shader("compute")]
@@ -1081,15 +1165,37 @@ void BakePSFCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 
     float3 psf = pow(max(acc, 0.0), 1.0 / max(ApertureBeamGain, 1.0));
 
+    // Dust scatter: the specks do not absorb the light they block, they scatter it. Willson et al.,
+    // "An optical model for image artifacts produced by dust particles on lenses" (iSAIRAS 2005)
+    // is the reference for how dust behaves here: a particle smaller than the aperture produces an
+    // artifact the size of the *aperture* whose depth is its area ratio, and dust at the pupil plane
+    // attenuates the whole frame uniformly rather than forming a halo. So the wing has two parts -
+    // a power-law skirt (stray light falls off with angle, never as fast as a Gaussian) and a flat
+    // pedestal for the pupil-plane case.
+    //
+    // The constant is an energy ratio, not a visual one: the kernel is normalised to unit sum, so
+    // what matters is the share of the bloom's energy the wing carries. Sum(1/(1+18r2) + 0.15) over
+    // the kernel grid is 1.885e4, so 1.3e-5 gives the wing (blocked * 0.25) of the core energy: a
+    // quarter of the blocked light lands inside the kernel, the rest goes to angles this transform
+    // cannot represent. Scaling by the wing's peak instead would put 250x the core's energy into
+    // the veil and turn the bloom into a flat grey wash. The shipped dust map blocks 17.6% of the
+    // pupil, so this is ~4% of the bloom with Dust Scatter at 1.
+    if (LensDirtScatter > 0.0)
+    {
+        float blocked = saturate(tex2Dfetch(stDustMean, int2(0, 0)).x);
+        float r2   = dot(dC, dC) * 4.0;                    // 0 centre, 1 mid-edge, 2 corner
+        float wing = 1.0 / (1.0 + 18.0 * r2) + 0.15;
+        psf += (LensDirtScatter * blocked * 1.3e-5 * wing).xxx;
+    }
+
     tex2Dstore(stAperture, o, float4(psf, 1.0));
 }
 
 [shader("compute")]
 void BakeCommitCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
-    if (!BakeNeeded())
-        return;
-
+    // Writes unconditionally. Gating this on BakeNeeded() means reading the very 1x1 texel the pass
+    // writes, which is undefined in D3D11; re-writing an unchanged signature is a no-op anyway.
     tex2Dstore(stBakeState, int2(0, 0), float4(BakeSignature(), 0.0, 0.0, 0.0));
 }
 #endif
@@ -1099,8 +1205,25 @@ void BakeCommitCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadI
 //  image FFT
 // ==========================================================================
 
+void KernelCommitCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
+{
+    // Ungated and write-only: the single point that commits the kernel signature, so no pass has to
+    // read and write the same texel. Re-writing an unchanged signature is a no-op.
+    tex2Dstore(stKernelState, int2(0, 0), float4(KernelSignature(), 0.0, 0.0, 0.0));
+}
+
+// The four image FFT passes only produce something the composite actually reads when the glow is
+// visible, or when a debug view shows the spectrum. Every one of them is compute, so returning
+// early is safe: the previous frame's spectrum simply stays in the buffers, unread.
+bool BloomNeeded()
+{
+    return BloomIntensity > 0.0 || DebugView == 1 || DebugView == 4;
+}
+
 void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
+    if (!BloomNeeded())
+        return;
     uint row  = dtid.y;
     uint lane = gtid.x;
 
@@ -1155,6 +1278,8 @@ void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
 [shader("compute")]
 void ImageFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
+    if (!BloomNeeded())
+        return;
     uint col  = dtid.x;
     uint lane = gtid.y;
 
@@ -1193,6 +1318,8 @@ void ImageFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
 [shader("compute")]
 void IFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
+    if (!BloomNeeded())
+        return;
     uint row  = dtid.y;
     uint lane = gtid.x;
 
@@ -1241,6 +1368,8 @@ void IFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 [shader("compute")]
 void IFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
+    if (!BloomNeeded())
+        return;
     uint col  = dtid.x;
     uint lane = gtid.y;
 
@@ -1295,13 +1424,21 @@ float3 BloomAtFiltered(float2 gridUV)
 
 void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o : SV_Target0)
 {
+    float3 scene = SceneLinear(uv);
+
+    // Intensity 0 with no spectrum debug view means the image chain skipped its passes, so those
+    // buffers hold stale data. Return the scene - and write it, never return without a value.
+    if (!BloomNeeded() && DebugView == 0)
+    {
+        o = float4(scene, 1.0);
+        return;
+    }
+
     float2 gridUV = ScreenToGrid(uv);
 
     float3 bloom = BloomAtFiltered(gridUV);
-    bloom *= exp2(-ExposureEV);
     bloom *= BloomTint;
 
-    float3 scene = SceneLinear(uv);
     float3 outc;
 
     if (BlendMode == 0)
@@ -1324,42 +1461,54 @@ void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o 
     }
     else if (DebugView == 3)
     {
+        // Pupil and kernel side by side. Each half is a square window in kernel space, so the
+        // frame's aspect cannot stretch the pattern; both are normalised to their own peak and
+        // never apply artistic controls (Beam Emphasis), or the view cannot be trusted.
+        float2 px     = uv * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+        float  side   = min(BUFFER_WIDTH * 0.5, BUFFER_HEIGHT);
+        bool   right  = uv.x >= 0.5;
+        float2 centre = float2(right ? BUFFER_WIDTH * 0.75 : BUFFER_WIDTH * 0.25, BUFFER_HEIGHT * 0.5);
+        float2 k      = (px - centre) / side + 0.5;
+        float  inside = (k.x >= 0.0 && k.x <= 1.0 && k.y >= 0.0 && k.y <= 1.0) ? 1.0 : 0.0;
+
+        float3 v = float3(0.0, 0.0, 0.0);
 
 #if KERNEL_MODE == 1
-        float2 kuv = 0.5 + (uv - 0.5) * 0.5;
-        float3 ks  = tex2Dlod(sApertureKernelPoint, float4(kuv, 0.0, 0.0)).rgb;
-        float3 kc  = tex2Dlod(sApertureKernelPoint, float4(0.5, 0.5, 0.0, 0.0)).rgb;
-        float  kp  = max(max(kc.r, max(kc.g, kc.b)), 1e-12);
-        float3 kv  = saturate(ks / kp);
-        kv = pow(max(kv, 0.0), max(ApertureBeamGain, 1.0));
-        outc = pow(saturate(kv), 1.0 / 2.2);
+        if (right)
+        {
+            float3 ks = tex2Dlod(sApertureKernelPoint, float4(k, 0.0, 0.0)).rgb;
+            float3 kc = tex2Dlod(sApertureKernelPoint, float4(0.5, 0.5, 0.0, 0.0)).rgb;
+            float  kp = max(max(kc.r, max(kc.g, kc.b)), 1e-12);
+            v = DehazeKernel(saturate(ks / kp));
+        }
+        else
+        {
+            // The bake stores the per-channel aperture mask, so dispersion shows up here as colour.
+            v = saturate(tex2Dlod(sPupil, float4(k, 0.0, 0.0)).rgb);
+        }
 #else
-        // Same framing as the aperture view: 2x zoom in kernel space, normalised by the
-        // kernel peak. Sampling with screen UV stretched the pattern by the content rect,
-        // which is why the DDS kernel looked wrong in this view.
-        float2 kuv = 0.5 + (uv - 0.5) * 0.5;
-        float  kp  = max(tex2Dlod(sKernelEnergy, float4(0.5, 0.5, 0.0, 0.0)).y, 1e-12);
-        float3 kv  = saturate(max(SampleKernel(kuv), 0.0) / kp);
-        outc = pow(saturate(kv), 1.0 / 2.2);
+        // A DDS kernel has no pupil: full PSF on the left, its core at 2x on the right.
+        float2 kk = right ? (0.5 + (k - 0.5) * 0.5) : k;
+        float  kp = max(tex2Dlod(sKernelEnergy, float4(0.5, 0.5, 0.0, 0.0)).y, 1e-12);
+        v = saturate(max(SampleKernel(kk), 0.0) / kp);
 #endif
+
+        outc = pow(saturate(v), 1.0 / 2.2) * inside;
+        if (abs(uv.x - 0.5) * BUFFER_WIDTH < 1.5)
+            outc = float3(0.08, 0.08, 0.08);
     }
     else if (DebugView == 4)
     {
-        float4 a = tex2D(sImageA, uv);
-        float4 b = tex2D(sImageB, uv);
-        float m = length(a.xy) + length(a.zw) + length(b.xy);
-        outc = log(1.0 + 5.0 * m).xxx;
+        // Normalised to its own DC, so black means "the spectrum is empty" rather than "the numbers
+        // are small": an unnormalised view reads as a dead pipeline even when it is working.
+        float  m  = length(tex2D(sImageA, uv).xy) + length(tex2D(sImageA, uv).zw)
+                  + length(tex2D(sImageB, uv).xy);
+        float4 a0 = tex2Dlod(sImageA, float4(0.001, 0.001, 0.0, 0.0));
+        float4 b0 = tex2Dlod(sImageB, float4(0.001, 0.001, 0.0, 0.0));
+        float  m0 = max(length(a0.xy) + length(a0.zw) + length(b0.xy), 1e-20);
+        outc = saturate(log(1.0 + 200.0 * (m / m0)) / log(201.0)).xxx;
     }
-    else if (DebugView == 7)
-    {
-#if KERNEL_MODE == 1
-
-        outc = saturate(tex2D(sPupil, ScreenToGrid(uv)).rgb);
-#else
-        outc = float3(0.0, 0.0, 0.0);
-#endif
-    }
-    else if (DebugView == 8)
+    else if (DebugView == 6)
     {
 #if KERNEL_MODE == 1
 
@@ -1370,15 +1519,6 @@ void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o 
 #else
         outc = float3(0.0, 0.0, 0.0);
 #endif
-    }
-    else if (DebugView == 6)
-    {
-
-        float2 q = uv * 2.0;
-        if (q.x < 1.0 && q.y < 1.0)      outc = float3(1.0, 0.0, 0.0);
-        else if (q.x >= 1.0 && q.y < 1.0) outc = float3(0.0, 1.0, 0.0);
-        else if (q.x < 1.0 && q.y >= 1.0) outc = float3(0.0, 0.0, 1.0);
-        else                              outc = float3(1.0, 1.0, 1.0);
     }
     else if (DebugView == 5)
     {
@@ -1429,12 +1569,12 @@ void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o 
     #define TECHNIQUE_TIP \
         "Unreal-style FFT convolution bloom driven by an analytic aperture.\n" \
         "\n" \
-        "The PSF (blade shape, curvature, ring, spikes, dispersion) is baked on\n" \
+        "The PSF (blade shape, curvature, ring, dispersion, dust) is baked on\n" \
         "the GPU once per settings change, then the frame is convolved with it\n" \
         "in the frequency domain, so cost is independent of kernel size.\n" \
         "Threshold -1 = physically based (everything blooms).\n" \
         "\n" \
-        "Debug view 3 shows the baked kernel, 2 the padding, 5 the quadrants."
+        "Debug view 3 shows the pupil and kernel, 4 the image spectrum, 6 the bake."
 #else
     #define TECHNIQUE_NAME  UE_FFTBloom
     #define TECHNIQUE_LABEL "UE FFT Convolution Bloom - Kernel Texture"
@@ -1446,7 +1586,7 @@ void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o 
         "arbitrary bloom shapes (starbursts, diffusion) at a cost independent\n" \
         "of kernel size. Threshold -1 = physically based (everything blooms).\n" \
         "\n" \
-        "Debug views 2/3 verify padding and the fftshifted kernel.\n" \
+        "Debug views 3 and 5 check the kernel and the padding.\n" \
         "For a fully procedural PSF enable UE_FFTBloom_Aperture instead."
 #endif
 
@@ -1461,17 +1601,18 @@ technique TECHNIQUE_NAME <
 {
 #if KERNEL_MODE == 1
     pass BakeAperture { ComputeShader = BakeApertureCS<16, 16, 1>; DispatchSizeX = BAKE_SIZE / 16; DispatchSizeY = BAKE_SIZE / 16; DispatchSizeZ = 1; }
+    pass DustSum      { ComputeShader = DustSumCS<DUST_SUM_THREADS, 1, 1>; DispatchSizeX = 1; DispatchSizeY = 1; DispatchSizeZ = 1; }
     pass BakeFFTX     { ComputeShader = BakeFFTXCS<BAKE_THREADS, 1, 1>; DispatchSizeX = 1;         DispatchSizeY = BAKE_SIZE; DispatchSizeZ = 1; }
     pass BakeFFTY     { ComputeShader = BakeFFTYCS<1, BAKE_THREADS, 1>; DispatchSizeX = BAKE_SIZE; DispatchSizeY = 1;         DispatchSizeZ = 1; }
     pass BakePSF      { ComputeShader = BakePSFCS<16, 16, 1>; DispatchSizeX = BAKE_SIZE / 16; DispatchSizeY = BAKE_SIZE / 16; DispatchSizeZ = 1; }
     pass BakeCommit   { ComputeShader = BakeCommitCS<1, 1, 1>; DispatchSizeX = 1; DispatchSizeY = 1; DispatchSizeZ = 1; }
 #endif
 
-    pass KernelPrep  { VertexShader = PostProcessVS; PixelShader = KernelPrepPS; RenderTarget0 = TexKernelA; RenderTarget1 = TexKernelB; }
-    pass KernelSum   { ComputeShader = KernelSumCS<256, 1, 1>; DispatchSizeX = 1; DispatchSizeY = 1; DispatchSizeZ = 1; }
+    pass KernelSum   { ComputeShader = KernelSumCS<KERNEL_SUM_THREADS, 1, 1>; DispatchSizeX = 1; DispatchSizeY = 1; DispatchSizeZ = 1; }
 
     pass KernelFFTX  { ComputeShader = KernelFFTXCS<FFT_THREADS, 1, 1>; DispatchSizeX = 1;         DispatchSizeY = FFT_SIZE; DispatchSizeZ = 1; }
     pass KernelFFTY  { ComputeShader = KernelFFTYCS<1, FFT_THREADS, 1>; DispatchSizeX = FFT_SIZE;   DispatchSizeY = 1;        DispatchSizeZ = 1; }
+    pass KernelCommit { ComputeShader = KernelCommitCS<1, 1, 1>; DispatchSizeX = 1; DispatchSizeY = 1; DispatchSizeZ = 1; }
 
     pass ImageFFTX   { ComputeShader = ImageFFTXCS<FFT_THREADS, 1, 1>;  DispatchSizeX = 1;         DispatchSizeY = FFT_SIZE; DispatchSizeZ = 1; }
     pass ImageFFTY   { ComputeShader = ImageFFTYCS<1, FFT_THREADS, 1>;  DispatchSizeX = FFT_SIZE;   DispatchSizeY = 1;        DispatchSizeZ = 1; }

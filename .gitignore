@@ -27,3 +27,6 @@ Thumbs.db
 
 # Local development material - not published
 _dev/
+
+# SweetOpt writes here by default when it is run from the repo root
+sopt-out/
