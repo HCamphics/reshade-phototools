@@ -1,0 +1,26 @@
+# Runtime artefacts and local state
+*.log
+*.ini
+ReShade64.dll
+ReShade32.dll
+dxgi.dll
+d3d9.dll
+d3d11.dll
+d3d12.dll
+opengl32.dll
+
+# Anything the user drops in locally
+reshade-shaders/Textures/Kernels/*.png
+reshade-shaders/Textures/Kernels/*.exr
+!.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
