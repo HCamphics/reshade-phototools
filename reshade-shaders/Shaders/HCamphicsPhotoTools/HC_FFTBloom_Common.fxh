@@ -1235,19 +1235,25 @@ void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
         if (s.x >= 0.0 && s.x <= 1.0 && s.y >= 0.0 && s.y <= 1.0)
             c = PrefilterLinear(SceneLinear(s), s);
 
-        g_fft0[GIDX(BitRev(k))] = float2(c.r, 0.0);
-        g_fft1[GIDX(BitRev(k))] = float2(c.g, 0.0);
+        g_fft0[GIDX(BitRev(k))] = float2(c.r, c.g);
         if (second) blue1 = c.b; else blue0 = c.b;
         second = true;
     }
     barrier();
 
-    FFTStages2(lane, true);
+    // Red and green travel as one complex sequence, real part red and imaginary green, so a single
+    // transform does the work of two. Because a real signal's spectrum is conjugate-symmetric, both
+    // spectra come back out of Z and its conjugate mirror:
+    //     X = (Z[k] + conj(Z[N-k])) / 2,   Y = (Z[k] - conj(Z[N-k])) / 2i
+    FFTStages1(lane, true);
 
     for (uint k2 = lane; k2 < FFT_SIZE; k2 += FFT_THREADS)
     {
-        float2 r  = g_fft0[GIDX(k2)] * INV_SQRT_N;
-        float2 gg = g_fft1[GIDX(k2)] * INV_SQRT_N;
+        float2 zk = g_fft0[GIDX(k2)];
+        float2 zm = g_fft0[GIDX((FFT_SIZE - k2) & (FFT_SIZE - 1))];
+        float2 zc = float2(zm.x, -zm.y);
+        float2 r  = (zk + zc) * (0.5 * INV_SQRT_N);
+        float2 gg = float2(zk.y - zc.y, zc.x - zk.x) * (0.5 * INV_SQRT_N);
         tex2Dstore(stImageA, int2((int)k2, (int)row), float4(r.x, r.y, gg.x, gg.y));
     }
     barrier();
