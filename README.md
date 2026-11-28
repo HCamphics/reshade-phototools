@@ -27,60 +27,7 @@ something a single baked kernel cannot do.
 
 ## Install
 
-1. Copy `reshade-shaders/Shaders/HCamphicsPhotoTools` into `<game>/reshade-shaders/Shaders`.
-2. For `HC_FFTBloom.fx`, also copy `reshade-shaders/Textures` - the kernels and the dust map.
-3. Enable the effect in ReShade's list.
-
-Presets written for earlier versions set uniforms that no longer exist. ReShade falls back to the
-defaults, so re-save the preset once to clear the log.
-
-## Depth of field
-
-Set up depth before anything else: run `DisplayDepth.fx` (in the same folder) to find the
-`RESHADE_DEPTH_INPUT_*` flags your game needs, then set `RESHADE_DEPTH_LINEARIZATION_FAR_PLANE` to the
-scene's far plane. The focus distance is in those units, so if that define is wrong, focus is scaled
-with it.
-
-Half resolution by default. Define `DOF_FULLRES=1` for a full-resolution gather, at about four times
-the cost.
-
-| control | what it does |
-|---|---|
-| `Focus Distance`, `Focal Length`, `Aperture` | the thin lens: what stays sharp, and how fast focus falls away |
-| `Max Blur Near`, `Max Blur Far` | ceilings on the disc radius, in pixels |
-| `Taps` | quality: the gather is Monte-Carlo, so grain falls as `1/Taps` |
-| `Denoise` | edge-aware clean-up of the gathered layers, never across a silhouette; 0 is the raw gather |
-| `Halo Spread` | how far a blurred foreground reaches past its silhouette, as a multiple of its own CoC |
-| `Highlight Boost`, `LoCA` | bokeh highlights, and longitudinal chromatic aberration |
-| `Blend In Linear Light` | average in light instead of the buffer's encoded values; leave off for HDR |
-| `Debug View` | CoC, dilated CoC, aperture, near and far layers, coverage |
-
-## Bloom
-
-The shared core transforms the point spread function once, then each frame is a transform, a multiply
-by the kernel spectrum and the inverse. Cost follows the FFT size rather than the kernel size, so an
-elaborate aperture costs the same as a plain disc. 15 passes in the aperture build, 10 in the kernel
-build; each file's header lists them.
-
-The bake only runs when a kernel control changes, so adjusting it costs one frame.
-
-| control | what it does |
-|---|---|
-| `Intensity`, `Threshold`, `Soft Knee`, `Highlight Shoulder` | how much light blooms and how clipped whites are treated |
-| `Kernel File` | which DDS kernel `HC_FFTBloom.fx` reads |
-| `Cat Eye`, `Cat Eye Angle`, `Dispersion`, `Beam Emphasis` | aperture shape, used by the bake |
-| `Scale`, `Rotation`, `Anamorphic Stretch` | kernel placement and stretch |
-| `Lens Dirt`, `Dust Gain`, `Dust Scatter`, `Dust Tiling` | the dust map, and how its specks scatter light |
-| `Blend Mode` | Additive is the physical one; Lerp is Unreal's artistic composite |
-
-Define `FTB_QUALITY=1` for finer dispersion at a slower bake.
-
-## Kernels and textures
-
-- `Textures/Kernels` - square, power-of-two, 8-bit BGRA DDS, one per look. They are declared in
-  `HC_FFTBloom_Common.fxh`, and a declared file that is missing makes ReShade skip the whole effect,
-  so the folder has to travel with the shaders.
-- `Textures/LensDirt` - a transmission map: white is a clean lens, black is dirt.
+1. Merge `reshade-shaders/` into `<game>/reshade-shaders/`.
 
 ## Licence
 
