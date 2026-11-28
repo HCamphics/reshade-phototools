@@ -13,11 +13,7 @@ driven by the same lens aperture.
 | `HC_FFTBloom.fx` | the same bloom with its PSF read from a DDS kernel | compute shaders, `Textures/Kernels` |
 | `HC_DoF.fx` | scatter-as-gather depth of field through the same aperture | compute shaders, game depth buffer |
 
-Enable one bloom, not both - they are the same core with a different kernel source.
-
-All three share `HC_Aperture.fxh`, so blades, apodization and the cat's-eye clip cannot drift between
-them. The DoF evaluates the pupil per tap, which lets the clip rotate with the pixel's field angle -
-something a single baked kernel cannot do.
+All three share `HC_Aperture.fxh`, so aperture settings are the same between them.
 
 ## Requirements
 
