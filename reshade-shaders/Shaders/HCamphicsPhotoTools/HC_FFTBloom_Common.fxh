@@ -1,48 +1,59 @@
 /*==============================================================================
 
-    HC FFT Bloom - real life accurate lens bloom for ReShade
+    HC FFT Bloom - shared core
+    Convolution bloom as a multiplication in the frequency domain, so cost follows the FFT size rather
+    than the kernel size: any PSF at the same runtime price.
 
-
+    Author:  HCamphics
     Repo:    https://github.com/HCamphics/reshade-phototools
     Licence: CC BY-NC 4.0 - see LICENSE in the repository root.
 
-    Convolution bloom evaluated as a multiplication in the frequency domain, so
-    cost depends on FFT size instead of kernel size: any PSF - blades, rings,
-    dust, anamorphic streaks - for the same runtime price.
+    Two effects share this file and differ only in where the point spread function comes from:
 
-    Shared core for two effects; only the source of the PSF differs:
-        HC_FFTBloom.fx           PSF read from a DDS kernel (Textures/Kernels)
-        HC_FFTBloom_Aperture.fx  PSF baked on the GPU from aperture controls
-    Kernels must be declared here: a declared file that is missing makes ReShade
-    skip the whole effect.
+        HC_FFTBloom.fx           PSF read from a DDS kernel in Textures/Kernels
+        HC_FFTBloom_Aperture.fx  PSF baked on the GPU from the aperture controls
 
-    Per frame:   prefilter -> FFT rows/cols -> multiply by kernel spectrum ->
-                 inverse FFT -> composite (+ lens dirt)
-    Per kernel:  pupil -> dispersion -> FFT -> energy + phase normalisation
+    Pipeline, 15 passes
 
-    Blend Mode decides how the glow meets the scene: Additive (the default) is the
-    physical one - scattered light adds to the image - while Lerp is Unreal's
-    artistic composite, where Intensity mixes scene into glow. Beam Emphasis is
-    artistic, not optical; the rest of the aperture group is aperture geometry.
+        once per kernel change
+        BakeAperture  pupil and dust -> PSF field             (KERNEL_MODE 1 only)
+        DustSum       normalise the dust map
+        BakeFFTX/Y    transform the PSF
+        BakePSF       spectral dispersion and beam emphasis
+        BakeCommit    energy and phase normalisation, store the signature
+        KernelSum     energy and statistics
+        KernelFFTX/Y  transform the kernel
+        KernelCommit  store it with the same normalisation
+
+        every frame
+        ImageFFTX     rows -> spectrum; red and green share one complex transform
+        ImageFFTY     columns -> spectrum
+        IFFTX         multiply by the kernel spectrum, inverse rows
+        IFFTY         inverse columns
+        Composite     add the glow to the frame, lens dirt, tonemap
+
+    The bake passes only do work when a kernel control changes: they compare a hash of those controls
+    against the stored signature and return. A pass list is fixed at load time, so they still dispatch.
+
+    Blend Mode decides how the glow meets the scene. Additive is the physical one, since scattered light
+    adds to the image; Lerp is Unreal's artistic composite, where Intensity mixes scene into glow. Beam
+    Emphasis is artistic, not optical; the rest of the aperture group is aperture geometry.
 
     Limits
-        - Bloom runs on the tonemapped LDR frame, so clipped highlights have
-          already lost their headroom. HDR input is a TODO (untestable here).
-        - Requires compute shaders: D3D11/12, Vulkan, OpenGL 4.3+. D3D9/D3D10
-          cannot load it.
-        - Kernels must be square, power-of-two, 8-bit BGRA DDS.
-
-    TODO
-        - HDR input path (no HDR display to test on)
-        - one-sided anamorphic streak, depth-faded bloom
+        - Runs on the tonemapped LDR frame, so clipped highlights have already lost their headroom.
+        - Needs compute shaders: D3D11/12, Vulkan, OpenGL 4.3+. D3D9 and D3D10 cannot load it.
+        - Kernels must be square, power-of-two, 8-bit BGRA DDS, and declared here: a declared file that
+          is missing makes ReShade skip the whole effect.
 
 ==============================================================================*/
+
 #include "ReShade.fxh"
 #include "ReShadeUI.fxh"
 
-// ==========================================================================
-//  preprocessor configuration
-// ==========================================================================
+/*==============================================================================
+    Preprocessor settings
+==============================================================================*/
+
 
 #ifndef KERNEL_MODE
 
@@ -146,9 +157,10 @@
 static const float TAU = 6.28318530718;
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
-// ==========================================================================
-//  UI uniforms
-// ==========================================================================
+/*==============================================================================
+    UI uniforms
+==============================================================================*/
+
 
 uniform float BloomIntensity <
     ui_type = "drag"; ui_min = 0.0; ui_max = 10.0; ui_step = 0.01;
@@ -307,9 +319,10 @@ uniform int DebugView <
     ui_tooltip = "3 shows the pupil and the kernel side by side. Leave at Final Composite for normal play.";
 > = 0;
 
-// ==========================================================================
-//  textures, samplers, storage
-// ==========================================================================
+/*==============================================================================
+    Resources
+==============================================================================*/
+
 
 texture TexImageA   { Width = FFT_SIZE; Height = FFT_SIZE; Format = SPEC_FMT; };
 texture TexImageB   { Width = FFT_SIZE; Height = FFT_SIZE; Format = SPEC_FMT; };
@@ -340,7 +353,6 @@ storage2D stKernelState { Texture = TexKernelState; };
 // size the veiling-glare wing. Kept in its own texture because TexBakeState is read by BakeNeeded()
 // in every bake pass, and writing a texel a pass also reads is undefined in D3D11.
 texture TexDustMean { Width = 1; Height = 1; Format = RGBA16F; };
-sampler sDustMean   { Texture = TexDustMean; };
 storage2D stDustMean { Texture = TexDustMean; };
 
 #if KERNEL_MODE == 0
@@ -441,9 +453,10 @@ sampler sLensDirt
 };
 #endif
 
-// ==========================================================================
-//  maths and helpers
-// ==========================================================================
+/*==============================================================================
+    Helpers
+==============================================================================*/
+
 
 // Signature hash for the caches below. A slider step must move the result by far more than float
 // noise: the smallest step contributes ~2e-4, while a difference in FMA contraction between two
@@ -580,9 +593,10 @@ float3 PrefilterLinear(float3 linearColor, float2 uv)
 }
 
 #if KERNEL_MODE == 1
-// ==========================================================================
-//  procedural aperture
-// ==========================================================================
+/*==============================================================================
+    Procedural aperture
+==============================================================================*/
+
 
 
 // The bloom's entry point: same maths, with its own pixel-softness floor from the bake grid.
@@ -592,9 +606,10 @@ float ApertureMask(float2 d)
                       3.0 / max(ApertureSize * (float)FFT_SIZE, 1.0));
 }
 
-// ==========================================================================
-//  kernel signature and sampling
-// ==========================================================================
+/*==============================================================================
+    Kernel signature and sampling
+==============================================================================*/
+
 
 float BakeSignature()
 {
@@ -728,9 +743,9 @@ float3 SampleKernel(float2 gridUV)
 groupshared float2 g_fft0[GFFT_SIZE];
 groupshared float2 g_fft1[GFFT_SIZE];
 
-// ==========================================================================
-//  FFT
-// ==========================================================================
+/*==============================================================================
+    FFT
+==============================================================================*/
 
 void FFTStages1N(uint lane, uint n, uint log2n, bool forward)
 {
@@ -796,9 +811,10 @@ void FFTStages1(uint lane, bool forward) { FFTStages1N(lane, FFT_SIZE, LOG2_FFT,
 void FFTStages2(uint lane, bool forward) { FFTStages2N(lane, FFT_SIZE, LOG2_FFT, forward); }
 void FFTStages2Bake(uint lane, bool forward) { FFTStages2N(lane, BAKE_SIZE, LOG2_BAKE, forward); }
 
-// ==========================================================================
-//  kernel spectrum
-// ==========================================================================
+/*==============================================================================
+    Kernel spectrum
+==============================================================================*/
+
 
 groupshared float2 g_kernel_stats[KERNEL_SUM_THREADS];
 
@@ -941,9 +957,10 @@ void KernelFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadI
 
 #if KERNEL_MODE == 1
 [shader("compute")]
-// ==========================================================================
-//  aperture bake
-// ==========================================================================
+/*==============================================================================
+    Aperture bake
+==============================================================================*/
+
 
 void BakeApertureCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
@@ -1182,9 +1199,10 @@ void BakeCommitCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadI
 #endif
 
 [shader("compute")]
-// ==========================================================================
-//  image FFT
-// ==========================================================================
+/*==============================================================================
+    Image fft
+==============================================================================*/
+
 
 void KernelCommitCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 {
@@ -1407,9 +1425,10 @@ void IFFTYCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
     barrier();
 }
 
-// ==========================================================================
-//  composite
-// ==========================================================================
+/*==============================================================================
+    Composite
+==============================================================================*/
+
 
 float3 BloomAt(float2 gridUV)
 {
@@ -1592,9 +1611,10 @@ void CompositePS(float4 vpos : SV_Position, float2 uv : TEXCOORD0, out float4 o 
         "For a fully procedural PSF enable HC_FFTBloom_Aperture instead."
 #endif
 
-// ==========================================================================
-//  passes
-// ==========================================================================
+/*==============================================================================
+    Passes
+==============================================================================*/
+
 
 technique TECHNIQUE_NAME <
     ui_label = TECHNIQUE_LABEL;

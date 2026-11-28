@@ -1,28 +1,34 @@
 /*==============================================================================
 
-    HC Depth of Field - bokeh through the aperture from HC_Aperture.fxh
+    HC Depth of Field
+    Scatter-as-gather depth of field through the aperture shared with the bloom.
 
+    Author:  HCamphics
     Repo:    https://github.com/HCamphics/reshade-phototools
     Licence: CC BY-NC 4.0 - see LICENSE in the repository root.
 
-    Depth of field by scatter-as-gather: every pixel gathers over a disc whose radius is its own
-    circle of confusion, so there are no holes and each pixel can apply its own depth test. The
-    aperture shape, its apodization and the cat's-eye clip are the ones the bloom bakes, evaluated
-    per tap - which means the clip can rotate with the pixel's field angle here, something a single
-    baked kernel cannot do.
+    Every pixel gathers over a disc whose radius is its own circle of confusion, so there are no holes
+    to fill and each tap can apply its own depth test. The pupil shape, its apodization and the
+    cat's-eye clip come from HC_Aperture.fxh and are evaluated per tap, so the clip can rotate with the
+    pixel's field angle - which a single baked kernel cannot do.
 
-    Pipeline
-        DoFCoC        depth -> signed circle of confusion, near and far, in pixels
-        DoFTileRange  min/max CoC per 16x16 tile, so flat tiles are skipped whole
-        DoFGather     half-resolution gather into far and near accumulators
-        DoFComposite  upsample, near/far handover, sharp detail kept where CoC is small
+    Pipeline, 8 passes, half resolution unless DOF_FULLRES=1
 
-    Depth comes from ReShade::GetLinearizedDepth, which returns view distance divided by
-    RESHADE_DEPTH_LINEARIZATION_FAR_PLANE (1000 by default). Set that define to your scene's far
-    plane, or the focus distance will be off by that factor. DisplayDepth.fx in the same folder is
-    the tool for checking the RESHADE_DEPTH_INPUT_* flags first.
+        DoFCoC        full     depth -> signed near and far CoC, in pixels
+        DoFColour     half     2x2 downsample, weighted by CoC so a silhouette is not averaged
+        DoFCoCHalf    half     near CoC reduced to the dilation grid (2x2 max)
+        DoFCoCSmall   half     small max on the CoC, which stabilises thin geometry
+        DoFDilate     eighth   dilated reach of the near CoC - this is what sets the halo's width
+        DoFGather     half     the gather, into separate far and near layers with coverage
+        DoFDenoise    half     edge-aware 3x3 over both layers
+        DoFComposite  full     upsample, sub-pixel bridge, additive composite
+
+    Depth is ReShade::GetLinearizedDepth divided by RESHADE_DEPTH_LINEARIZATION_FAR_PLANE, so set that
+    define to the scene's far plane or the focus distance is off by that factor. DisplayDepth.fx is the
+    tool for checking the RESHADE_DEPTH_INPUT_* flags first.
 
 ==============================================================================*/
+
 #include "ReShade.fxh"
 #include "ReShadeUI.fxh"
 #include "HC_Aperture.fxh"
@@ -50,8 +56,6 @@
 // cap allows - and reading it bilinearly still gives a continuous ramp rather than a stepped one.
 #define DIL_W     ((BUFFER_WIDTH  + 7) / 8)
 #define DIL_H     ((BUFFER_HEIGHT + 7) / 8)
-#define RCP_DIL_W (1.0 / (float)DIL_W)
-#define RCP_DIL_H (1.0 / (float)DIL_H)
 #define SENSOR_WIDTH_MM 36.0     // full frame; only sets the mm-to-pixel scale of the CoC
 #define GOLDEN_ANGLE    2.39996323
 #define MAX_TAPS        96
@@ -70,9 +74,10 @@
     #define TAP_COUNT ((int)clamp((float)Quality, 4.0, (float)MAX_TAPS))
 #endif
 
-// ==========================================================================
-//  controls
-// ==========================================================================
+/*==============================================================================
+    UI uniforms
+==============================================================================*/
+
 
 uniform float FocusDistance <
     ui_type = "drag"; ui_min = 0.05; ui_max = 100.0; ui_step = 0.01;
@@ -182,9 +187,10 @@ uniform int DebugView <
     ui_tooltip = "Leave at Final. Circle of Confusion is the first thing to check after setting the depth flags.";
 > = 0;
 
-// ==========================================================================
-//  resources
-// ==========================================================================
+/*==============================================================================
+    Resources
+==============================================================================*/
+
 
 texture TexColour { Width = GATHER_W;     Height = GATHER_H;     Format = RGBA16F; };
 texture TexCoC  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
@@ -223,9 +229,10 @@ storage2D stNear { Texture = TexNear; };
 storage2D stFarS  { Texture = TexFarS; };
 storage2D stNearS { Texture = TexNearS; };
 
-// ==========================================================================
-//  helpers
-// ==========================================================================
+/*==============================================================================
+    Helpers
+==============================================================================*/
+
 
 // ReShade returns view distance divided by the linearisation far plane, so this is metres.
 float LinearDepth(float2 uv)
@@ -271,9 +278,10 @@ float2 CatEyeAt(float2 uv)
     return float2(amt, atan2(field.y, field.x));
 }
 
-// ==========================================================================
-//  passes
-// ==========================================================================
+/*==============================================================================
+    Passes
+==============================================================================*/
+
 
 // sRGB transfer curves for the optional linear-light blend.
 float3 SRGBToLinear3(float3 c)
@@ -404,10 +412,9 @@ void DoFCoCSmall_CS(uint3 tid : SV_DispatchThreadID)
     tex2Dstore(stCoCSmall, p, float4(m, 0.0, 0.0, 0.0));
 }
 
-// Dilation of the near CoC, which is what lets a blurred foreground's halo reach pixels whose own CoC
-// is zero. A max filter at quarter resolution, read back bilinearly: continuous, where the tile grid it
-// replaces quantised the halo extent to 16 px and left stair-steps along every silhouette. Five cells
-// each way covers 12 px, which is the range Foreground Reach exposes.
+// Dilation of the near CoC, which is what lets a blurred foreground's halo reach pixels whose own CoC is
+// zero. A max filter at one eighth of the frame, read back bilinearly: continuous, where a coarser grid
+// quantises the halo's extent and leaves stair-steps along the silhouette.
 [shader("compute")]
 void DoFDilate_CS(uint3 tid : SV_DispatchThreadID)
 {
@@ -772,9 +779,13 @@ float4 DoFComposite_PS(float4 vpos : SV_Position, float2 uv : TEXCOORD0) : SV_Ta
     return float4(colour, 1.0);
 }
 
+/*==============================================================================
+    Technique
+==============================================================================*/
+
 technique HC_DoF <
     ui_label = "HC Depth of Field";
-    ui_tooltip = "Scatter-as-gather depth of field through the aperture the bloom bakes, with the cat's-eye clip rotating toward the frame corners.\n\nNeeds depth: check the RESHADE_DEPTH_INPUT_* flags with DisplayDepth.fx first, and set RESHADE_DEPTH_LINEARIZATION_FAR_PLANE to the scene's far plane.";
+    ui_tooltip = "Scatter-as-gather depth of field through the shared aperture, with the cat's-eye clip rotating toward the frame corners.\n\nNeeds depth: check the RESHADE_DEPTH_INPUT_* flags with DisplayDepth.fx first, and set RESHADE_DEPTH_LINEARIZATION_FAR_PLANE to the scene's far plane.";
 >
 {
     pass DoFCoC       { ComputeShader = DoFCoC_CS<16, 16, 1>;   DispatchSizeX = (BUFFER_WIDTH + 15) / 16;  DispatchSizeY = (BUFFER_HEIGHT + 15) / 16; DispatchSizeZ = 1; }

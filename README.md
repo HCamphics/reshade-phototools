@@ -1,67 +1,95 @@
 # reshade phototools
 
-A ReShade shader collection for in-game photography.
+Shaders for in-game photography: a physically shaped FFT bloom and a matching depth of field, both
+driven by the same lens aperture.
+
 <!-- TODO: screenshots -->
 
-## Contents
+## Effects
 
-**FFT Bloom** - a from-scratch implementation of Unreal Engine's bloom convolution, plus
-extensions: a procedural aperture kernel (blades, cat's eye, soap-bubble and hot-centre pupil
-weighting), spectral dispersion, beam emphasis, and lens dust that scatters the light.
+| shader | what it is | needs |
+|---|---|---|
+| `HC_FFTBloom_Aperture.fx` | FFT bloom, point spread function baked from the aperture controls | compute shaders |
+| `HC_FFTBloom.fx` | the same bloom with its PSF read from a DDS kernel | compute shaders, `Textures/Kernels` |
+| `HC_DoF.fx` | scatter-as-gather depth of field through the same aperture | compute shaders, game depth buffer |
 
-Two effects share one implementation (`HC_FFTBloom_Common.fxh`) and differ only in where the
-kernel comes from:
+Enable one bloom, not both - they are the same core with a different kernel source.
 
-- `HC_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls.
-- `HC_FFTBloom.fx` — the kernel is read from a DDS kernel in `reshade-shaders/Textures/Kernels`.
-
-Enable one or the other. The DDS effect needs the `Kernels` folder; the aperture effect does not.
-
-**Depth of Field** - `HC_DoF.fx`, scatter-as-gather depth of field through the same aperture, with the
-cat's-eye clip rotating toward the frame corners instead of being baked into one kernel. Needs the
-game's depth buffer: check the `RESHADE_DEPTH_INPUT_*` flags with ReShade's DisplayDepth first, and set
-`RESHADE_DEPTH_LINEARIZATION_FAR_PLANE` to your scene's far plane. Half resolution by default; define
-`DOF_FULLRES=1` for a full-resolution gather.
-
-Controls worth knowing: `Taps` is the quality knob, since the gather is Monte-Carlo and grain falls as
-`1/Taps`. `Denoise` removes that grain with an edge-aware filter that refuses silhouettes and layer
-edges; 0 gives the raw gather. `Halo Spread` scales how far a blurred foreground reaches past its own
-silhouette, where 1 is physical and there is no pixel cap. `Blend In Linear Light` averages in light
-instead of in the buffer's encoded values, which removes the fringe along hard bright edges; leave it
-off for HDR output.
-
-Both effects take their pupil shape from `HC_Aperture.fxh`, so blades, apodization and the cat's eye
-cannot drift between them.
-
-### Kernels and textures
-
-The kernels in `Textures/Kernels` are included and made by yours truly, more planned. Adding or removing one means declaring it in the shader.
-
-The dust map in `Textures/LensDirt` is a transmission map also made by yours truly, white is a clean lens, black is dirt.
+All three share `HC_Aperture.fxh`, so blades, apodization and the cat's-eye clip cannot drift between
+them. The DoF evaluates the pupil per tap, which lets the clip rotate with the pixel's field angle -
+something a single baked kernel cannot do.
 
 ## Requirements
-- ReShade 6.8.0 minimum. Any graphics API with **compute shader** support: D3D11 / D3D12 / Vulkan / OpenGL 4.3+
+
+- ReShade 6.8 or newer.
+- Any API with compute shader support: D3D11, D3D12, Vulkan, OpenGL 4.3+.
+- `HC_DoF.fx` also needs a readable depth buffer.
 
 ## Install
 
-Merge `reshade-shaders/` into the game's ReShade folder. The shaders sit in
-`Shaders/HCamphicsPhotoTools/`.
+1. Copy `reshade-shaders/Shaders/HCamphicsPhotoTools` into `<game>/reshade-shaders/Shaders`.
+2. For `HC_FFTBloom.fx`, also copy `reshade-shaders/Textures` - the kernels and the dust map.
+3. Enable the effect in ReShade's list.
 
-Presets written for earlier versions set uniforms that no longer exist. ReShade logs them as unknown
-and falls back to the defaults, so re-save the preset once to clear the log.
+Presets written for earlier versions set uniforms that no longer exist. ReShade falls back to the
+defaults, so re-save the preset once to clear the log.
+
+## Depth of field
+
+Set up depth before anything else: run `DisplayDepth.fx` (in the same folder) to find the
+`RESHADE_DEPTH_INPUT_*` flags your game needs, then set `RESHADE_DEPTH_LINEARIZATION_FAR_PLANE` to the
+scene's far plane. The focus distance is in those units, so if that define is wrong, focus is scaled
+with it.
+
+Half resolution by default. Define `DOF_FULLRES=1` for a full-resolution gather, at about four times
+the cost.
+
+| control | what it does |
+|---|---|
+| `Focus Distance`, `Focal Length`, `Aperture` | the thin lens: what stays sharp, and how fast focus falls away |
+| `Max Blur Near`, `Max Blur Far` | ceilings on the disc radius, in pixels |
+| `Taps` | quality: the gather is Monte-Carlo, so grain falls as `1/Taps` |
+| `Denoise` | edge-aware clean-up of the gathered layers, never across a silhouette; 0 is the raw gather |
+| `Halo Spread` | how far a blurred foreground reaches past its silhouette, as a multiple of its own CoC |
+| `Highlight Boost`, `LoCA` | bokeh highlights, and longitudinal chromatic aberration |
+| `Blend In Linear Light` | average in light instead of the buffer's encoded values; leave off for HDR |
+| `Debug View` | CoC, dilated CoC, aperture, near and far layers, coverage |
+
+## Bloom
+
+The shared core transforms the point spread function once, then each frame is a transform, a multiply
+by the kernel spectrum and the inverse. Cost follows the FFT size rather than the kernel size, so an
+elaborate aperture costs the same as a plain disc. 15 passes in the aperture build, 10 in the kernel
+build; each file's header lists them.
+
+The bake only runs when a kernel control changes, so adjusting it costs one frame.
+
+| control | what it does |
+|---|---|
+| `Intensity`, `Threshold`, `Soft Knee`, `Highlight Shoulder` | how much light blooms and how clipped whites are treated |
+| `Kernel File` | which DDS kernel `HC_FFTBloom.fx` reads |
+| `Cat Eye`, `Cat Eye Angle`, `Dispersion`, `Beam Emphasis` | aperture shape, used by the bake |
+| `Scale`, `Rotation`, `Anamorphic Stretch` | kernel placement and stretch |
+| `Lens Dirt`, `Dust Gain`, `Dust Scatter`, `Dust Tiling` | the dust map, and how its specks scatter light |
+| `Blend Mode` | Additive is the physical one; Lerp is Unreal's artistic composite |
+
+Define `FTB_QUALITY=1` for finer dispersion at a slower bake.
+
+## Kernels and textures
+
+- `Textures/Kernels` - square, power-of-two, 8-bit BGRA DDS, one per look. They are declared in
+  `HC_FFTBloom_Common.fxh`, and a declared file that is missing makes ReShade skip the whole effect,
+  so the folder has to travel with the shaders.
+- `Textures/LensDirt` - a transmission map: white is a clean lens, black is dirt.
 
 ## Licence
 
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, modify and share
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) - free to use, modify and share
 for non-commercial purposes, with credit and a link back. See `LICENSE`. Developed with AI
 assistance. Human-authored contributions: the design, control set, kernel set, tuning, testing,
 and all modifications to generated code.
 
 ## Credits
-- Unreal Engine's documented Bloom Convolution (behavioural reference)
-- [RealBloom](https://github.com/bean-mhm/realbloom) by bean-mhm (behavioral reference)
-- [Unity high-performance convolution bloom](https://github.com/StellarWarp/High-Performance-Convolution-Bloom-On-Unity) (behavioral reference)
-- [iMMERSE FFT bloom](https://guides.martysmods.com/shaders/immerseultimate/convolutionbloom/) by Pascal Gilcher (settings reference)
-- [An optical model for image artifacts produced by dust
-  particles on lenses](https://www-robotics.jpl.nasa.gov/media/documents/3_willson_11b.pdf) by Willson, Maimone, Johnson, and Scherr
 
+Every reference this project used - optics and depth of field, denoising, the FFT bloom work, lens dust,
+colour handling and tooling - is listed in [CREDITS.md](CREDITS.md).
