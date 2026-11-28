@@ -133,7 +133,10 @@ float PupilShape(float2 d, float catEye, float catEyeAngle, float pixSoft)
         float2 q  = d * (2.0 / max(ApertureSize, 1e-4)) - float2(cos(ang), sin(ang)) * u;
         // The rim sits well away from the pupil plane, so its projected edge is defocused: wider
         // than the blade edge, which also keeps the cusp diffraction from reading as streaks.
-        float rimSoft = clamp(3.0 * soft, 0.01, 0.35);
+        // Softer than the blade edge, as the rim is defocused - but only the lens's own softness is
+        // amplified by three. Scaling the tap footprint too made this a quarter of the pupil wide when
+        // the depth of field passes its per-tap softness in, which ate the crescent into a blob.
+        float rimSoft = clamp(max(3.0 * ApertureSoftness, pixSoft), 0.02, 0.35);
         mask *= 1.0 - smoothstep(1.0 - rimSoft, 1.0 + 0.5 * rimSoft, length(q));
     }
 

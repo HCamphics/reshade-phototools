@@ -53,6 +53,7 @@ the cost.
 | `Halo Spread` | how far a blurred foreground reaches past its silhouette, as a multiple of its own CoC |
 | `Highlight Boost`, `LoCA` | bokeh highlights, and longitudinal chromatic aberration |
 | `Blend In Linear Light` | average in light instead of the buffer's encoded values; leave off for HDR |
+| `Focus Helper` | whites out what is inside the depth of field, at a fixed half, so the plane can be dialled by eye; nothing outside it is touched, and it never draws over the debug views |
 | `Debug View` | CoC, dilated CoC, aperture, near and far layers, coverage |
 
 ## Bloom

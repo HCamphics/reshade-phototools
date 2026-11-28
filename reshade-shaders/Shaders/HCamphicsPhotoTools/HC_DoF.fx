@@ -12,16 +12,15 @@
     cat's-eye clip come from HC_Aperture.fxh and are evaluated per tap, so the clip can rotate with the
     pixel's field angle - which a single baked kernel cannot do.
 
-    Pipeline, 8 passes, half resolution unless DOF_FULLRES=1
+    Pipeline, 7 passes, half resolution unless DOF_FULLRES=1
 
         DoFCoC        full     depth -> signed near and far CoC, in pixels
-        DoFColour     half     2x2 downsample, weighted by CoC so a silhouette is not averaged
-        DoFCoCHalf    half     near CoC reduced to the dilation grid (2x2 max)
+        DoFColour     half     2x2 downsample weighted by CoC, and the 2x2 CoC reduction with it
         DoFCoCSmall   half     small max on the CoC, which stabilises thin geometry
         DoFDilate     eighth   dilated reach of the near CoC - this is what sets the halo's width
         DoFGather     half     the gather, into separate far and near layers with coverage
         DoFDenoise    half     edge-aware 3x3 over both layers
-        DoFComposite  full     upsample, sub-pixel bridge, additive composite
+        DoFComposite  full     upsample, sub-pixel bridge, additive composite, focus helper
 
     Depth is ReShade::GetLinearizedDepth divided by RESHADE_DEPTH_LINEARIZATION_FAR_PLANE, so set that
     define to the scene's far plane or the focus distance is off by that factor. DisplayDepth.fx is the
@@ -58,6 +57,8 @@
 #define DIL_H     ((BUFFER_HEIGHT + 7) / 8)
 #define SENSOR_WIDTH_MM 36.0     // full frame; only sets the mm-to-pixel scale of the CoC
 #define GOLDEN_ANGLE    2.39996323
+#define SIN_GA          0.67549029      // sin(GOLDEN_ANGLE)
+#define COS_GA         -0.73736888      // cos(GOLDEN_ANGLE)
 #define MAX_TAPS        96
 
 // Soft clamp on the prefiltered colour, in linear luminance. Only matters for an HDR source: on a
@@ -78,6 +79,14 @@
     UI uniforms
 ==============================================================================*/
 
+
+// First control on purpose: focus is what this effect is aimed at, and this is where the autofocus
+// controls will sit once they are built (see _dev/DOF-PLAN.md section 26).
+uniform bool FocusHelper <
+    ui_category = "Depth of Field";
+    ui_label = "Focus Helper";
+    ui_tooltip = "Whites out what is inside the depth of field, so the focus distance can be dialled by eye. Everything outside it is left alone. Over the final image only, never over the debug views. Untick it once the plane is where you want it.";
+> = false;
 
 uniform float FocusDistance <
     ui_type = "drag"; ui_min = 0.05; ui_max = 100.0; ui_step = 0.01;
@@ -208,6 +217,11 @@ texture TexFarS  { Width = GATHER_W;    Height = GATHER_H;     Format = RGBA16F;
 texture TexNearS { Width = GATHER_W;    Height = GATHER_H;     Format = RGBA16F; };
 
 sampler sColour { Texture = TexColour; AddressU = CLAMP; AddressV = CLAMP; MagFilter = LINEAR; MinFilter = LINEAR; MipFilter = POINT; };
+// The gather reads the colour unfiltered: TexColour is half res, so a filtered tap straddling a
+// silhouette mixes foreground colour with background colour while the point-sampled CoC still says the
+// sample belongs to one layer. The wrong layer's colour then enters, as a speckle of flecks strung
+// along every depth edge. Point sampling keeps colour and classification on the same texel.
+sampler sColourPoint { Texture = TexColour; AddressU = CLAMP; AddressV = CLAMP; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
 sampler sCoC  { Texture = TexCoC;  AddressU = CLAMP; AddressV = CLAMP; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
 sampler sCoCHalf  { Texture = TexCoCHalf;  AddressU = CLAMP; AddressV = CLAMP; MagFilter = POINT;  MinFilter = POINT;  MipFilter = POINT; };
 sampler sCoCSmall { Texture = TexCoCSmall; AddressU = CLAMP; AddressV = CLAMP; MagFilter = LINEAR; MinFilter = LINEAR; MipFilter = POINT; };
@@ -241,22 +255,30 @@ float LinearDepth(float2 uv)
 }
 
 // Thin lens: c = f^2 / (N (S1 - f)) * |S2 - S1| / S2 is a diameter on the sensor, so halve it once here.
-// Returns (near radius, far radius) in pixels; only one is non-zero.
-float2 CoCPixels(float2 uv)
+// K folds the lens constants and the pixel scale together, so the mm-to-pixel scale lives in one place
+// and anything that needs to reason about a distance in pixels reads the same number the passes do.
+float CoCSlopeK()
 {
-    float S2 = max(LinearDepth(uv), 1e-3);
     float S1 = max(FocusDistance, 1e-3);
     float f  = FocalLength * 0.001;
     float N  = max(ApertureNumber, 1.0);
+    float pxPerM = 0.5 * ((float)BUFFER_WIDTH / SENSOR_WIDTH_MM) * 1000.0;
 
-    // c = K (S1 / S2 - 1) with K = f^2 / (N (S1 - f)), so the per-pixel cost is one divide and an
-    // add once K and the pixel scale are folded into scale/bias. Positive means in front of focus.
-    float K       = (f * f) / (N * max(S1 - f, 1e-4));
-    float pxPerM  = 0.5 * ((float)BUFFER_WIDTH / SENSOR_WIDTH_MM) * 1000.0;
-    float bias    = -K * pxPerM;
-    float scale   =  K * S1 * pxPerM;
+    return (f * f) / (N * max(S1 - f, 1e-4)) * pxPerM;
+}
 
-    float signed_px = scale / S2 + bias;
+// Radius in pixels at a distance, signed: positive means in front of focus. This is the whole CoC law,
+// with k = CoCSlopeK(), so c = k (S1 / S2 - 1) and a pixel costs one divide, one multiply, one subtract.
+float SignedCoCPixels(float S2, float k, float S1)
+{
+    return k * (S1 / max(S2, 1e-3) - 1.0);
+}
+
+// Returns (near radius, far radius) in pixels; only one is non-zero.
+float2 CoCPixels(float2 uv)
+{
+    float S1 = max(FocusDistance, 1e-3);
+    float signed_px = SignedCoCPixels(LinearDepth(uv), CoCSlopeK(), S1);
 
     return float2(min(max( signed_px, 0.0), MaxBlurNear),
                   min(max(-signed_px, 0.0), MaxBlurFar));
@@ -322,6 +344,7 @@ void DoFColour_CS(uint3 tid : SV_DispatchThreadID)
 
     float3 c    = 0.0;
     float  wsum = 0.0;
+    float  maxNear = 0.0;
     [unroll]
     for (int dy = -1; dy <= 1; dy += 2)
     {
@@ -334,6 +357,9 @@ void DoFColour_CS(uint3 tid : SV_DispatchThreadID)
             float  w   = exp2(-d * d * 0.09);        // half weight at 3.4 px of CoC difference
             c    += SampleSharp(t) * w;
             wsum += w;
+            // These four CoC fetches are the 2x2 the CoC reduction used to make in its own pass, so
+            // the reduction is written from here and that pass is gone.
+            maxNear = max(maxNear, coc.x);
         }
     }
     c = (wsum > 1e-5) ? c / wsum : SampleSharp(uv);
@@ -341,13 +367,11 @@ void DoFColour_CS(uint3 tid : SV_DispatchThreadID)
     float luma = max(c.r, max(c.g, c.b));
     c *= 1.0 / (1.0 + max(luma - HIGHLIGHT_CLAMP, 0.0) / max(HIGHLIGHT_CLAMP, 1.0));
 
-    tex2Dstore(stColour, int2(tid.xy), float4(c, 1.0));
+    tex2Dstore(stColour,  int2(tid.xy), float4(c, 1.0));
+    tex2Dstore(stCoCHalf, int2(tid.xy), float4(maxNear, 0.0, 0.0, 0.0));
 
-    // Zero coverage in both layers. The composite's leftover term is the sharp frame, so an untouched
-    // texel needs no stand-in colour: nothing gathered means the sharp frame shows, and in-focus pixels
-    // stay the real sharp pixels rather than the prefiltered copy of them.
-    tex2Dstore(stFar,  int2(tid.xy), float4(0.0, 0.0, 0.0, 0.0));
-    tex2Dstore(stNear, int2(tid.xy), float4(0.0, 0.0, 0.0, 0.0));
+    // The layer buffers are not seeded here: the gather writes every texel of them, including the ones
+    // it skips, so seeding them was a dead store of two half-resolution targets every frame.
 }
 
 [shader("compute")]
@@ -364,22 +388,6 @@ void DoFCoC_CS(uint3 tid : SV_DispatchThreadID)
 
 // CoC at gather resolution: the max of the 2x2 full-resolution texels each covers, so a silhouette's
 // defocus survives the reduction instead of being averaged away.
-[shader("compute")]
-void DoFCoCHalf_CS(uint3 tid : SV_DispatchThreadID)
-{
-    if (tid.x >= GATHER_W || tid.y >= GATHER_H)
-        return;
-
-    float2 uv  = (float2(tid.xy) + 0.5) * float2(RCP_GATHER_W, RCP_GATHER_H);
-    float2 tex = float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT) * (float)GATHER_DIV * 0.5;
-
-    float a = tex2Dlod(sCoC, float4(uv + float2(-tex.x, -tex.y), 0.0, 0.0)).x;
-    float b = tex2Dlod(sCoC, float4(uv + float2( tex.x, -tex.y), 0.0, 0.0)).x;
-    float c = tex2Dlod(sCoC, float4(uv + float2(-tex.x,  tex.y), 0.0, 0.0)).x;
-    float d = tex2Dlod(sCoC, float4(uv + float2( tex.x,  tex.y), 0.0, 0.0)).x;
-
-    tex2Dstore(stCoCHalf, int2(tid.xy), float4(max(max(a, b), max(c, d)), 0.0, 0.0, 0.0));
-}
 
 // A small max on the CoC, which is what the blend decision reads. Depth is one sample per pixel, so a
 // thin feature - the edge of a leaf - alternates between its own depth and the background behind it,
@@ -437,9 +445,14 @@ void DoFDilate_CS(uint3 tid : SV_DispatchThreadID)
 
             // Disc-limited: a foreground's blur reaches its own CoC past its silhouette, so a neighbour
             // only counts while the distance to it is within that CoC.
+            // A cell farther away than the CoC cap cannot hold a value that reaches, so it need not be
+            // fetched: with MaxBlurNear at 12 that is 9 cells of the 49.
             float  dist = length(float2((float)dx, (float)dy)) * 8.0;
-            float  near = tex2Dlod(sCoCSmall, float4(c, 0.0, 0.0)).x;
-            m = max(m, near >= dist ? near : 0.0);
+            if (dist <= MaxBlurNear)
+            {
+                float near = tex2Dlod(sCoCSmall, float4(c, 0.0, 0.0)).x;
+                m = max(m, near >= dist ? near : 0.0);
+            }
         }
     }
 
@@ -474,7 +487,10 @@ void DoFGather_CS(uint3 tid : SV_DispatchThreadID)
     float2 cat        = CatEyeAt(uv);
     float  pupilScale = ApertureSize * 0.5;      // the module puts the pupil edge at |d| = size/2
     // Tap count follows the radius: a wide disc needs more samples to keep its rim smooth.
-    float  taps       = clamp(floor((float)TAP_COUNT * sqrt(max(radiusPx, 1.0) / 6.0) + 0.5),
+    // The stretch makes the disc an ellipse, whose area grows with it, so the tap budget grows too -
+    // otherwise the long axis is sampled more coarsely than the short one.
+    float  taps       = clamp(floor((float)TAP_COUNT * sqrt(max(radiusPx, 1.0) / 6.0)
+                                    * sqrt(max(Anamorphic, 0.01)) + 0.5),
                               8.0, (float)MAX_TAPS);
     float  rcpR       = 1.0 / max(radiusPx, 1e-4);
 
@@ -491,20 +507,28 @@ void DoFGather_CS(uint3 tid : SV_DispatchThreadID)
     // something closer to grain.
     float rot = frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453) * 6.28318530718;
 
+    // The spiral's direction is the same rotation every tap, so it is advanced with a 2x2 rotation
+    // instead of a sincos: one transcendental for the loop rather than one per tap. It advances before
+    // any `continue` so a skipped tap cannot desynchronise it.
+    float sn0, cs0;
+    sincos(rot, sn0, cs0);
+    float2 dir = float2(cs0, sn0);
+
     [loop]
     for (int i = 0; i < (int)taps; ++i)
     {
         float  t   = ((float)i + 0.5) / taps;
         float  rr  = sqrt(t) * radiusPx;
-        float  ang = (float)i * GOLDEN_ANGLE + rot;
-        float2 off = float2(cos(ang), sin(ang)) * float2(1.0, Anamorphic) * rr;
+        float2 off = dir * float2(1.0, Anamorphic) * rr;
+        dir = float2(dir.x * COS_GA - dir.y * SIN_GA,
+                     dir.x * SIN_GA + dir.y * COS_GA);
 
         // Clamped, not skipped. A dropped tap contributes no weight, so coverage falls away at the
         // frame border and a blurred object at the edge of the screen loses part of its halo; repeating
         // the border texel keeps the weight, which is what the coverage term below depends on.
         float2 suv = saturate(uv + off * float2(RCP_GATHER_W, RCP_GATHER_H));
 
-        float3 sc    = tex2Dlod(sColour, float4(suv, 0.0, 0.0)).rgb;
+        float3 sc    = tex2Dlod(sColourPoint, float4(suv, 0.0, 0.0)).rgb;
         float2 scoc  = tex2Dlod(sCoC, float4(suv, 0.0, 0.0)).xy;
         float  srad  = max(scoc.x, scoc.y) / (float)GATHER_DIV;
 
@@ -559,9 +583,19 @@ void DoFGather_CS(uint3 tid : SV_DispatchThreadID)
     float3 v      = saturate(wUsed / max(wAll, 1e-6));
     float3 aNearC = saturate(nearW / max(wUsed, 1e-6));
 
+    // v is measured against the whole gathered disc, and beside a foreground that disc is far wider
+    // than the pixel's own blur: the dilation widened it so it could reach the halo, so most of its
+    // taps are background texels too far away to reach, and v collapses to a few tens of a percent.
+    // Starving the far layer with that number handed the rest of the pixel to the sharp frame - an
+    // unblurred band around every near object, sharp detail and all, carrying the sharp silhouette's
+    // hard edge into the middle of its own halo. The far layer takes every direction the near layer
+    // does not instead, scaled by whether this pixel is defocused at all, so an in-focus surface still
+    // keeps the sharp frame and only its share is left uncovered.
+    float  defocused = saturate((max(cocCentre.x, cocCentre.y) - 0.5) / 1.5);
+
     // Both layers leave premultiplied by their own coverage, so the composite can simply add them.
     float3 aNear = v * aNearC;
-    float3 aFar  = v * (1.0 - aNearC);
+    float3 aFar  = (1.0 - aNear) * defocused;
 
     const float3 LW = float3(0.2126, 0.7152, 0.0722);
 
@@ -629,6 +663,15 @@ void DoFDenoise_CS(uint3 tid : SV_DispatchThreadID)
     float4 f0 = tex2Dlod(sFar,  float4(uv, 0.0, 0.0));
     float4 n0 = tex2Dlod(sNear, float4(uv, 0.0, 0.0));
     float  coc0 = tex2Dlod(sGatherCoC, float4(uv, 0.0, 0.0)).r;
+
+    // At zero strength the filter is an identity, so pass the layers through instead of averaging them
+    // with weights of zero.
+    if (Denoise <= 0.0)
+    {
+        tex2Dstore(stFarS,  p, f0);
+        tex2Dstore(stNearS, p, n0);
+        return;
+    }
 
     float lc  = dot(f0.rgb, LW);
     float lcn = dot(n0.rgb, LW);
@@ -776,6 +819,17 @@ float4 DoFComposite_PS(float4 vpos : SV_Position, float2 uv : TEXCOORD0) : SV_Ta
     if (LinearBlend)
         colour = LinearToSRGB3(colour);
 
+    // Focus helper. Drawn last, in display space, and over the final image only: the debug views are raw
+    // buffers and tinting them would only make them harder to read.
+    //
+    // Peaking, after iMMERSE's depth of field: white where the pixel is sharp enough to see, nothing at
+    // all elsewhere. The two sides of the plane used to be tinted warm and cool, which reads well in
+    // isolation but has to be judged against whatever colour the scene happens to be - and against a
+    // bright wall the tint is simply invisible. Left at a fixed half so what is behind the highlight is
+    // still readable.
+    if (DebugView == 0 && FocusHelper && max(coc.x, coc.y) < 1.0)
+        colour = lerp(colour, 1.0, 0.5);
+
     return float4(colour, 1.0);
 }
 
@@ -790,7 +844,6 @@ technique HC_DoF <
 {
     pass DoFCoC       { ComputeShader = DoFCoC_CS<16, 16, 1>;   DispatchSizeX = (BUFFER_WIDTH + 15) / 16;  DispatchSizeY = (BUFFER_HEIGHT + 15) / 16; DispatchSizeZ = 1; }
     pass DoFColour    { ComputeShader = DoFColour_CS<16, 16, 1>; DispatchSizeX = (GATHER_W + 15) / 16;     DispatchSizeY = (GATHER_H + 15) / 16;     DispatchSizeZ = 1; }
-    pass DoFCoCHalf   { ComputeShader = DoFCoCHalf_CS<8, 8, 1>;   DispatchSizeX = (GATHER_W + 7) / 8;      DispatchSizeY = (GATHER_H + 7) / 8;      DispatchSizeZ = 1; }
     pass DoFCoCSmall  { ComputeShader = DoFCoCSmall_CS<8, 8, 1>;  DispatchSizeX = (GATHER_W + 7) / 8;      DispatchSizeY = (GATHER_H + 7) / 8;      DispatchSizeZ = 1; }
     pass DoFDilate    { ComputeShader = DoFDilate_CS<8, 8, 1>;  DispatchSizeX = (DIL_W + 7) / 8;         DispatchSizeY = (DIL_H + 7) / 8;         DispatchSizeZ = 1; }
     pass DoFGather    { ComputeShader = DoFGather_CS<8, 8, 1>;  DispatchSizeX = (GATHER_W + 7) / 8;        DispatchSizeY = (GATHER_H + 7) / 8;        DispatchSizeZ = 1; }
