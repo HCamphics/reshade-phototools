@@ -1157,21 +1157,10 @@ void BakePSFCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID)
 
     float3 psf = pow(max(acc, 0.0), 1.0 / max(ApertureBeamGain, 1.0));
 
-    // Dust scatter: the specks do not absorb the light they block, they scatter it. Willson et al.,
-    // "An optical model for image artifacts produced by dust particles on lenses" (iSAIRAS 2005)
-    // is the reference for how dust behaves here: a particle smaller than the aperture produces an
-    // artifact the size of the *aperture* whose depth is its area ratio, and dust at the pupil plane
-    // attenuates the whole frame uniformly rather than forming a halo. So the wing has two parts -
-    // a power-law skirt (stray light falls off with angle, never as fast as a Gaussian) and a flat
-    // pedestal for the pupil-plane case.
-    //
-    // The constant is an energy ratio, not a visual one: the kernel is normalised to unit sum, so
-    // what matters is the share of the bloom's energy the wing carries. Sum(1/(1+18r2) + 0.15) over
-    // the kernel grid is 1.885e4, so 1.3e-5 gives the wing (blocked * 0.25) of the core energy: a
-    // quarter of the blocked light lands inside the kernel, the rest goes to angles this transform
-    // cannot represent. Scaling by the wing's peak instead would put 250x the core's energy into
-    // the veil and turn the bloom into a flat grey wash. The shipped dust map blocks 17.6% of the
-    // pupil, so this is ~4% of the bloom with Dust Scatter at 1.
+    // Dust scatter: particles scatter the light they block rather than absorbing it (Willson et al.,
+    // iSAIRAS 2005), over the whole pupil, so the wing is a power-law skirt plus a flat pedestal.
+    // 1.3e-5 is an energy ratio against the unit-sum kernel: the wing then carries a quarter of the
+    // blocked light, the rest going to angles this grid cannot represent.
     if (LensDirtScatter > 0.0)
     {
         float blocked = saturate(tex2Dfetch(stDustMean, int2(0, 0)).x);
@@ -1219,6 +1208,24 @@ void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
     uint row  = dtid.y;
     uint lane = gtid.x;
 
+    // A zero row transforms to a zero row, and s.y depends only on the row, so one test skips the whole
+    // row: the content covers 39% of a 16:9 frame inside the square grid.
+    float2 rowScreen = GridToScreen(float2(0.5 * RCP_FFT_SIZE, ((float)row + 0.5) * RCP_FFT_SIZE));
+    if (rowScreen.y < 0.0 || rowScreen.y > 1.0)
+    {
+        for (uint z = lane; z < FFT_SIZE; z += FFT_THREADS)
+        {
+            tex2Dstore(stImageA, int2((int)z, (int)row), float4(0.0, 0.0, 0.0, 0.0));
+            tex2Dstore(stImageB, int2((int)z, (int)row), float4(0.0, 0.0, 0.0, 0.0));
+        }
+        return;
+    }
+
+    // One sampling pass for all three channels; blue waits in registers until the shared array is free.
+    // Two scalars rather than an array, which a runtime index would spill to local memory.
+    float blue0 = 0.0, blue1 = 0.0;
+    bool  second = false;
+
     for (uint k = lane; k < FFT_SIZE; k += FFT_THREADS)
     {
         float2 g = float2(((float)k + 0.5) * RCP_FFT_SIZE, ((float)row + 0.5) * RCP_FFT_SIZE);
@@ -1230,6 +1237,8 @@ void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
 
         g_fft0[GIDX(BitRev(k))] = float2(c.r, 0.0);
         g_fft1[GIDX(BitRev(k))] = float2(c.g, 0.0);
+        if (second) blue1 = c.b; else blue0 = c.b;
+        second = true;
     }
     barrier();
 
@@ -1244,16 +1253,11 @@ void ImageFFTXCS(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
     barrier();
 
 
+    second = false;
     for (uint k3 = lane; k3 < FFT_SIZE; k3 += FFT_THREADS)
     {
-        float2 g = float2(((float)k3 + 0.5) * RCP_FFT_SIZE, ((float)row + 0.5) * RCP_FFT_SIZE);
-        float2 s = GridToScreen(g);
-
-        float3 c = float3(0.0, 0.0, 0.0);
-        if (s.x >= 0.0 && s.x <= 1.0 && s.y >= 0.0 && s.y <= 1.0)
-            c = PrefilterLinear(SceneLinear(s), s);
-
-        g_fft0[GIDX(BitRev(k3))] = float2(c.b, 0.0);
+        g_fft0[GIDX(BitRev(k3))] = float2(second ? blue1 : blue0, 0.0);
+        second = true;
     }
     barrier();
 

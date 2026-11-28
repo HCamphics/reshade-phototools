@@ -15,8 +15,23 @@ kernel comes from:
 - `HC_FFTBloom_Aperture.fx` — the kernel is baked on the GPU from the aperture controls.
 - `HC_FFTBloom.fx` — the kernel is read from a DDS kernel in `reshade-shaders/Textures/Kernels`.
 
-Enable one or the other. The DDS effect needs the
-`Kernels` folder; the aperture effect does not.
+Enable one or the other. The DDS effect needs the `Kernels` folder; the aperture effect does not.
+
+**Depth of Field** - `HC_DoF.fx`, scatter-as-gather depth of field through the same aperture, with the
+cat's-eye clip rotating toward the frame corners instead of being baked into one kernel. Needs the
+game's depth buffer: check the `RESHADE_DEPTH_INPUT_*` flags with ReShade's DisplayDepth first, and set
+`RESHADE_DEPTH_LINEARIZATION_FAR_PLANE` to your scene's far plane. Half resolution by default; define
+`DOF_FULLRES=1` for a full-resolution gather.
+
+Controls worth knowing: `Taps` is the quality knob, since the gather is Monte-Carlo and grain falls as
+`1/Taps`. `Denoise` removes that grain with an edge-aware filter that refuses silhouettes and layer
+edges; 0 gives the raw gather. `Halo Spread` scales how far a blurred foreground reaches past its own
+silhouette, where 1 is physical and there is no pixel cap. `Blend In Linear Light` averages in light
+instead of in the buffer's encoded values, which removes the fringe along hard bright edges; leave it
+off for HDR output.
+
+Both effects take their pupil shape from `HC_Aperture.fxh`, so blades, apodization and the cat's eye
+cannot drift between them.
 
 ### Kernels and textures
 
